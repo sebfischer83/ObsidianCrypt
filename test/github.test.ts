@@ -176,3 +176,28 @@ describe("GitHub client behaviour", () => {
     }
   });
 });
+
+describe("GitHub eventual consistency", () => {
+  it("stale branch reads right after a push are not mistaken for a rollback", async () => {
+    const { server, a, b } = await githubDevices();
+    server.staleRefReads = 2;
+    for (let i = 0; i < 5; i++) a.fs.setText(`n${i}.md`, `v${i}`);
+    a.reconfigure({ maxFilesPerCommit: 2 });
+    await a.sync(); // several commits in one run
+    a.fs.setText("n0.md", "changed");
+    await a.sync();
+    await a.sync();
+    await b.sync();
+    expect(b.fs.text("n0.md")).toBe("changed");
+    expect(b.fs.paths()).toHaveLength(5);
+  });
+
+  it("GET requests ask GitHub not to serve cached responses", async () => {
+    const { server, a } = await githubDevices();
+    a.fs.setText("x.md", "x");
+    await a.sync();
+    const gets = server.requests.filter((r) => r.method === "GET");
+    expect(gets.length).toBeGreaterThan(0);
+    expect(gets.every((r) => r.headers["Cache-Control"] === "no-cache")).toBe(true);
+  });
+});

@@ -29,6 +29,9 @@ export class FakeGitHubServer implements HttpClient {
   readonly requests: HttpRequest[] = [];
   readonly failures: InjectedFailure[] = [];
   repoExists = true;
+  /** Eventual consistency: after a ref update, this many ref reads still return the previous commit. */
+  staleRefReads = 0;
+  private stale = new Map<string, { sha: string; remaining: number }>();
   canPush = true;
 
   constructor(
@@ -91,6 +94,11 @@ export class FakeGitHubServer implements HttpClient {
     let m: RegExpMatchArray | null;
     if (req.method === "GET" && (m = path.match(/^\/git\/ref\/heads\/(.+)$/))) {
       if (empty) return this.json(409, { message: "Git Repository is empty." });
+      const lagging = this.stale.get(m[1] as string);
+      if (lagging && lagging.remaining > 0) {
+        lagging.remaining--;
+        return this.json(200, { ref: `refs/heads/${m[1]}`, object: { sha: lagging.sha, type: "commit" } });
+      }
       const sha = this.refs.get(m[1] as string);
       return sha ? this.json(200, { ref: `refs/heads/${m[1]}`, object: { sha, type: "commit" } }) : this.json(404, { message: "Not Found" });
     }
@@ -184,6 +192,7 @@ export class FakeGitHubServer implements HttpClient {
       const target = body.sha as string;
       if (body.force !== false) throw new Error("plugin must never force-push");
       if (!this.isAncestor(current, target)) return this.json(422, { message: "Update is not a fast forward" });
+      if (this.staleRefReads > 0) this.stale.set(branch, { sha: current, remaining: this.staleRefReads });
       this.refs.set(branch, target);
       return this.json(200, { object: { sha: target } });
     }

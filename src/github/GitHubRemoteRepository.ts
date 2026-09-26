@@ -140,7 +140,10 @@ export class GitHubRemoteRepository implements RemoteRepository {
     const current = await this.api.getBranchHead(this.branch);
     if (current !== expectedParent) {
       if (await this.landed(newCommit, current)) return;
-      throw new SyncError("ConcurrentRemoteUpdate");
+      // GitHub reads can lag behind writes. If the branch still shows an OLDER commit, let the server
+      // decide: the update is fast-forward-only, so it can never discard commits we have not seen.
+      const staleRead = typeof current === "string" && (await this.isAncestor(current, expectedParent));
+      if (!staleRead) throw new SyncError("ConcurrentRemoteUpdate");
     }
     let accepted: boolean;
     try {

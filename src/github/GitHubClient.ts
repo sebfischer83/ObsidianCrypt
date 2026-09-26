@@ -91,6 +91,9 @@ export class GitHubClient {
         Accept: options.accept ?? "application/vnd.github+json",
         Authorization: await this.o.auth.authorizationHeader(),
         "X-GitHub-Api-Version": API_VERSION,
+        // GitHub sends "Cache-Control: max-age=60"; a cached branch ref would look like a rollback.
+        "Cache-Control": "no-cache",
+        Pragma: "no-cache",
       };
       if (body !== undefined) headers["Content-Type"] = "application/json";
 

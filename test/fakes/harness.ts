@@ -58,6 +58,7 @@ export class Device {
       limits: this.limits,
       deviceId: this.deviceId,
       now: () => this.now,
+      sleep: async () => undefined,
     });
   }
 

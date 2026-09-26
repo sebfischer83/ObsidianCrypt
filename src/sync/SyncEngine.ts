@@ -42,6 +42,9 @@ export const DEFAULT_LIMITS: SyncLimits = {
 };
 
 /** Base64 request bodies must stay below GitHub's 100 MB limit (72 MiB × 4/3 ≈ 96 MiB). */
+/** Re-read delays when the remote head appears to be behind our last known commit (eventual consistency). */
+const STALE_READ_DELAYS_MS = [2_000, 5_000, 10_000, 20_000];
+
 export const HARD_MAX_FILE_SIZE = 72 * 1024 * 1024;
 
 export type SyncMode = "full" | "pull";
@@ -73,6 +76,7 @@ export interface SyncEngineOptions {
   readonly limits?: Partial<SyncLimits>;
   readonly deviceId: string;
   readonly now?: () => number;
+  readonly sleep?: (ms: number) => Promise<void>;
   readonly logger?: Logger;
 }
 
@@ -84,6 +88,7 @@ type PushOutcome = "nothing" | "done" | "more" | "concurrent";
 export class SyncEngine {
   private readonly limits: SyncLimits;
   private readonly now: () => number;
+  private readonly sleep: (ms: number) => Promise<void>;
   private readonly log: Logger;
   /** Last validated remote configuration (for UI / password change). */
   lastConfig: PublicVaultConfig | null = null;
@@ -92,6 +97,7 @@ export class SyncEngine {
     const merged = { ...DEFAULT_LIMITS, ...o.limits };
     this.limits = { ...merged, maxFileSize: Math.min(merged.maxFileSize, HARD_MAX_FILE_SIZE) };
     this.now = o.now ?? (() => Date.now());
+    this.sleep = o.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.log = o.logger ?? silentLogger;
   }
 
@@ -170,10 +176,22 @@ export class SyncEngine {
   // ───────────────────────── steps ─────────────────────────
 
   private async fetchHead(): Promise<string> {
-    const head = await this.o.remote.getHead();
-    if (head.kind === "ok") return head.commit;
-    if (this.state.lastRemoteCommit !== null) throw SyncError.blocked("BranchDeleted");
-    throw new SyncError("NotConfigured", "remote branch not initialised");
+    const last = this.state.lastRemoteCommit;
+    for (let attempt = 0; ; attempt++) {
+      const head = await this.o.remote.getHead();
+      const commit = head.kind === "ok" ? head.commit : null;
+      // Right after our own push GitHub may still report the previous head (or none). Such a stale read
+      // must not be mistaken for a rollback/deleted branch: re-read a few times before concluding.
+      const behind = last !== null && commit !== last && (commit === null || (await this.o.remote.isAncestor(commit, last)));
+      if (behind && attempt < STALE_READ_DELAYS_MS.length) {
+        this.log.info("remote head looks stale, re-reading", { attempt });
+        await this.sleep(STALE_READ_DELAYS_MS[attempt] as number);
+        continue;
+      }
+      if (commit !== null) return commit;
+      if (last !== null) throw SyncError.blocked("BranchDeleted");
+      throw new SyncError("NotConfigured", "remote branch not initialised");
+    }
   }
 
   private async recoverPendingCommit(head: string, report: SyncReport): Promise<void> {
