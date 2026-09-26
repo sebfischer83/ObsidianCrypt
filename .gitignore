@@ -1,0 +1,7 @@
+node_modules/
+main.js
+.vitest/
+*.log
+data.json
+state-*.json
+state-*.json.new

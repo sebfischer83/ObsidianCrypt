@@ -1,0 +1,44 @@
+name: Release
+
+# Push a tag equal to the version in manifest.json (e.g. `0.1.0`, no "v" prefix).
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - run: npm ci
+
+      - name: Check tag matches manifest version
+        run: |
+          version=$(node -p "require('./manifest.json').version")
+          if [ "$version" != "${GITHUB_REF_NAME}" ]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match manifest version $version" >&2
+            exit 1
+          fi
+
+      - run: npm test
+
+      - run: npm run build
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "${GITHUB_REF_NAME}" \
+            --draft \
+            main.js manifest.json styles.css

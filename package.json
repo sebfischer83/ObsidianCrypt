@@ -1,0 +1,39 @@
+{
+  "name": "obsidian-encrypted-github-sync",
+  "version": "0.1.0",
+  "description": "End-to-end encrypted synchronisation of an Obsidian vault with a GitHub repository.",
+  "main": "main.js",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc --noEmit -p tsconfig.json && node esbuild.config.mjs production",
+    "dev": "node esbuild.config.mjs",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "version": "node version-bump.mjs && git add manifest.json versions.json"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sebfischer83/ObsidianCrypt.git"
+  },
+  "keywords": [
+    "obsidian",
+    "plugin",
+    "encryption",
+    "sync",
+    "github"
+  ],
+  "author": "Sebastian Fischer",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^26.6.3",
+    "esbuild": "^0.28.2",
+    "obsidian": "^1.13.1",
+    "typescript": "^7.0.2",
+    "vitest": "^5.0.2"
+  },
+  "dependencies": {
+    "@noble/hashes": "^2.4.0"
+  }
+}

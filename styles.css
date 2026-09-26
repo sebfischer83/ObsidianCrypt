@@ -1,0 +1,16 @@
+/* Encrypted GitHub Sync */
+
+.encrypted-sync-recovery-key {
+  user-select: all;
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-size: var(--font-ui-medium);
+  padding: var(--size-4-2);
+  border-radius: var(--radius-s);
+  background-color: var(--background-secondary);
+}
+
+.encrypted-sync-ignore-rules {
+  width: 100%;
+  font-family: var(--font-monospace);
+}
