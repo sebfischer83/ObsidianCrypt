@@ -1,6 +1,6 @@
 import { Modal, Notice, Setting, type App } from "obsidian";
 import { MIN_PASSWORD_LENGTH } from "../crypto/KeyManager";
-import { describeError } from "../errors/VaultSyncError";
+import { describeError, logUnexpected } from "../errors/VaultSyncError";
 import type EncryptedSyncPlugin from "../main";
 import type { RemoteInspection } from "../sync/VaultSetup";
 import { formatBytes, showRecoveryKey } from "./Modals";
@@ -100,11 +100,15 @@ export class SetupWizard extends Modal {
       this.plugin.settings.repo = this.repo;
       this.plugin.settings.branch = this.branch;
       this.plugin.setToken(this.token);
+      if (!this.plugin.secrets.persistent) {
+        new Notice(`The system keychain is not available${this.plugin.secrets.lastError ? ` (${describeError(this.plugin.secrets.lastError, [this.token])})` : ""}. The token is kept in memory for this session only.`, 12000);
+      }
       await this.plugin.saveSettings();
       this.step = result.inspection.kind === "vault" ? "join" : "create";
       this.render();
     } catch (error: unknown) {
-      new Notice(`Connection failed: ${describeError(error)}`, 10000);
+      new Notice(`Connection failed: ${describeError(error, [this.token])}`, 15000);
+      logUnexpected(this.plugin.settings.debugLogging, "setup: check repository", error, [this.token]);
     } finally {
       this.busy = false;
     }
@@ -164,7 +168,8 @@ export class SetupWizard extends Modal {
               if (recoveryKey) await showRecoveryKey(this.app, recoveryKey);
               await this.plugin.syncCommand("full");
             } catch (error: unknown) {
-              new Notice(`Setup failed: ${describeError(error)}`, 10000);
+              new Notice(`Setup failed: ${describeError(error, [this.token])}`, 15000);
+              logUnexpected(this.plugin.settings.debugLogging, "setup: create vault", error, [this.token]);
               b.setDisabled(false).setButtonText("Encrypt and upload");
             } finally {
               this.busy = false;
@@ -212,7 +217,8 @@ export class SetupWizard extends Modal {
               this.close();
               await this.plugin.syncCommand("full");
             } catch (error: unknown) {
-              new Notice(describeError(error), 10000);
+              new Notice(`Connecting failed: ${describeError(error, [this.token])}`, 15000);
+              logUnexpected(this.plugin.settings.debugLogging, "setup: connect vault", error, [this.token]);
               b.setDisabled(false).setButtonText("Unlock and sync");
             } finally {
               this.busy = false;

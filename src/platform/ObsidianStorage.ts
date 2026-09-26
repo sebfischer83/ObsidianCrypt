@@ -37,7 +37,9 @@ interface SecretStorageLike {
  * never written to data.json.
  */
 export class ObsidianSecretStore implements SecretStore {
-  readonly persistent: boolean;
+  private available: boolean;
+  /** Set when the platform secret storage rejected a write; secrets then stay in memory only. */
+  lastError: unknown = null;
   private readonly fallback = new MemorySecretStore();
   private readonly storage: SecretStorageLike | null;
 
@@ -45,25 +47,50 @@ export class ObsidianSecretStore implements SecretStore {
     // Official API since Obsidian 1.11.4 (minAppVersion); the runtime check only guards against broken builds.
     const storage: SecretStorageLike | undefined = app.secretStorage;
     this.storage = storage && typeof storage.getSecret === "function" && typeof storage.setSecret === "function" ? storage : null;
-    this.persistent = this.storage !== null;
+    this.available = this.storage !== null;
+  }
+
+  get persistent(): boolean {
+    return this.available;
   }
 
   get(id: string): string | null {
-    if (!this.storage) return this.fallback.get(id);
-    const value = this.storage.getSecret(id);
-    return value ? value : null;
+    const memory = this.fallback.get(id);
+    if (memory !== null || !this.storage) return memory;
+    try {
+      const value = this.storage.getSecret(id);
+      return value ? value : null;
+    } catch (error: unknown) {
+      this.lastError = error;
+      return null;
+    }
   }
 
   set(id: string, value: string): void {
     assertSecretId(id);
-    if (!this.storage) this.fallback.set(id, value);
-    else this.storage.setSecret(id, value);
+    if (this.storage) {
+      try {
+        this.storage.setSecret(id, value);
+        this.fallback.delete(id);
+        return;
+      } catch (error: unknown) {
+        // Never fail the whole setup because the keychain refused: keep it for this session only.
+        this.lastError = error;
+        this.available = false;
+      }
+    }
+    this.fallback.set(id, value);
   }
 
   delete(id: string): void {
-    // The API has no delete; an empty value is treated as absent.
-    if (!this.storage) this.fallback.delete(id);
-    else this.storage.setSecret(id, "");
+    this.fallback.delete(id);
+    if (!this.storage) return;
+    try {
+      // The API has no delete; an empty value is treated as absent.
+      this.storage.setSecret(id, "");
+    } catch (error: unknown) {
+      this.lastError = error;
+    }
   }
 }
 

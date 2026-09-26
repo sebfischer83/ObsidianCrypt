@@ -34,7 +34,8 @@ export class MemorySecretStore implements SecretStore {
   }
 }
 
+/** Short, strictly lowercase-alphanumeric-with-dashes ids (Obsidian validates secret ids). */
 export const SecretIds = {
-  githubToken: (pluginScope: string): string => `${pluginScope}-github-token`,
-  masterKey: (pluginScope: string, vaultId: string): string => `${pluginScope}-mk-${vaultId}`,
+  githubToken: (deviceId: string): string => `egsync-token-${deviceId.replace(/[^0-9a-f]/g, "").slice(0, 16)}`,
+  masterKey: (vaultId: string): string => `egsync-mk-${vaultId.replace(/[^0-9a-f]/g, "").slice(0, 32)}`,
 } as const;

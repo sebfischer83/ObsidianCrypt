@@ -155,3 +155,15 @@ describe("leak detector (positive control)", () => {
     expect(findLeaks([crypto.randomBytes(4096)], [secret])).toEqual([]);
   });
 });
+
+describe("error display", () => {
+  it("shows foreign error messages but never credentials", async () => {
+    const { describeError } = await import("../src/errors/VaultSyncError");
+    const token = "github_pat_11ABCDEFG0123456789_abcdefghijklmnopqrstuvwxyz";
+    const shown = describeError(new Error(`request failed: Authorization: Bearer ${token} / ${token} / ghp_abcdefghijklmnop123`), [token]);
+    expect(shown).toContain("request failed");
+    expect(shown).not.toContain(token);
+    expect(shown).not.toContain("ghp_abcdefghijklmnop123");
+    expect(describeError(new TypeError("x is undefined"))).toBe("Unexpected error (TypeError: x is undefined)");
+  });
+});

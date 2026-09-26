@@ -2,7 +2,7 @@ import { Modal, Notice, Plugin, Setting, TAbstractFile, TFolder } from "obsidian
 import { WebCryptoProvider } from "./crypto/WebCryptoProvider";
 import { KeyManager, MIN_PASSWORD_LENGTH, unlockWithPassword, VaultKeys } from "./crypto/KeyManager";
 import { CryptoError } from "./errors/CryptoError";
-import { describeError } from "./errors/VaultSyncError";
+import { describeError, logUnexpected } from "./errors/VaultSyncError";
 import { PersonalAccessTokenAuth } from "./github/GitHubAuth";
 import { GitHubClient } from "./github/GitHubClient";
 import { GitObjectsApi } from "./github/GitObjectsApi";
@@ -134,11 +134,11 @@ export default class EncryptedSyncPlugin extends Plugin {
   }
 
   private tokenSecretId(): string {
-    return SecretIds.githubToken(`encrypted-github-sync-${this.deviceId}`);
+    return SecretIds.githubToken(this.deviceId);
   }
 
   private masterKeySecretId(vaultId: string): string {
-    return SecretIds.masterKey("encrypted-github-sync", vaultId);
+    return SecretIds.masterKey(vaultId);
   }
 
   getToken(): string | null {
@@ -148,6 +148,11 @@ export default class EncryptedSyncPlugin extends Plugin {
   setToken(token: string): void {
     if (token) this.secrets.set(this.tokenSecretId(), token.trim());
     else this.secrets.delete(this.tokenSecretId());
+  }
+
+  private tokenList(): string[] {
+    const token = this.getToken();
+    return token ? [token] : [];
   }
 
   isConfigured(): boolean {
@@ -334,7 +339,8 @@ export default class EncryptedSyncPlugin extends Plugin {
       if (report) this.reportResult(report, true);
       else new Notice("A synchronisation is already running; it will run again when finished.");
     } catch (error: unknown) {
-      new Notice(`Encrypted sync: ${describeError(error)}`, 10000);
+      new Notice(`Encrypted sync: ${describeError(error, this.tokenList())}`, 10000);
+      logUnexpected(this.settings.debugLogging, "sync command", error, this.tokenList());
     }
   }
 
