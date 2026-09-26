@@ -1,4 +1,4 @@
-import { Modal, Notice, Plugin, Setting, TAbstractFile, TFolder } from "obsidian";
+import { Notice, Plugin, setIcon, TAbstractFile, TFolder } from "obsidian";
 import { WebCryptoProvider } from "./crypto/WebCryptoProvider";
 import { KeyManager, MIN_PASSWORD_LENGTH, unlockWithPassword, VaultKeys } from "./crypto/KeyManager";
 import { CryptoError } from "./errors/CryptoError";
@@ -36,7 +36,8 @@ import { DEFAULT_IGNORE_RULES, IGNORE_FILE, SyncFilter, type FilterSettings } fr
 import { ConflictView } from "./ui/ConflictView";
 import { SettingsTab } from "./ui/SettingsTab";
 import { SetupWizard } from "./ui/SetupWizard";
-import { confirmDialog, openChangePasswordModal, promptVaultSecret, showRecoveryKey } from "./ui/Modals";
+import { openChangePasswordModal, promptVaultSecret, showRecoveryKey } from "./ui/Modals";
+import { StatusModal } from "./ui/StatusModal";
 import { StatusBar, statusText } from "./ui/StatusBar";
 
 const DEVICE_ID_KEY = "encrypted-github-sync-device-id";
@@ -53,6 +54,8 @@ export default class EncryptedSyncPlugin extends Plugin {
   controller!: SyncController;
   fs!: ObsidianFileSystem;
   private statusBar!: StatusBar;
+  private ribbonEl: HTMLElement | null = null;
+  private readonly statusListeners = new Set<(status: SyncStatus) => void>();
   private lastEngine: SyncEngine | null = null;
   private persistHandle: number | null = null;
 
@@ -69,6 +72,8 @@ export default class EncryptedSyncPlugin extends Plugin {
     this.fs = new ObsidianFileSystem(this.app, () => (this.settings.syncConfigDir ? [this.app.vault.configDir] : []));
 
     this.statusBar = new StatusBar(this.addStatusBarItem(), () => this.openStatus());
+    // Obsidian mobile has no status bar: the ribbon icon shows the state and opens the status dialog.
+    this.ribbonEl = this.addRibbonIcon("cloud", "Encrypted sync", () => this.openStatus());
     this.controller = new SyncController({
       runSync: (mode) => this.runEngine(mode),
       countPending: () => this.buildEngine().countPendingChanges(),
@@ -83,7 +88,7 @@ export default class EncryptedSyncPlugin extends Plugin {
         clearInterval: (h) => window.clearInterval(h),
         now: () => Date.now(),
       },
-      onStatus: (status) => this.statusBar.render(status),
+      onStatus: (status) => this.publishStatus(status),
       onReport: (report) => this.reportResult(report, false),
       onError: (error) => this.logger.warn("automatic sync failed", { crypto: error instanceof CryptoError }),
       logger: this.logger,
@@ -393,8 +398,29 @@ export default class EncryptedSyncPlugin extends Plugin {
     new ConflictView(this.app, { list: () => this.store.state.conflicts, dismiss: (id) => this.dismissConflict(id) }).open();
   }
 
-  private openStatus(): void {
+  openStatus(): void {
     new StatusModal(this).open();
+  }
+
+  /** Subscribe to status changes (settings tab, status dialog). Returns the unsubscribe function. */
+  onStatusChange(listener: (status: SyncStatus) => void): () => void {
+    this.statusListeners.add(listener);
+    return () => this.statusListeners.delete(listener);
+  }
+
+  private publishStatus(status: SyncStatus): void {
+    this.statusBar.render(status);
+    if (this.ribbonEl) {
+      setIcon(this.ribbonEl, ribbonIcon(status));
+      this.ribbonEl.setAttribute("aria-label", `Encrypted sync: ${statusText(status)}`);
+    }
+    for (const listener of this.statusListeners) {
+      try {
+        listener(status);
+      } catch (error: unknown) {
+        logUnexpected(this.settings.debugLogging, "status listener", error);
+      }
+    }
   }
 
   private registerVaultEvents(): void {
@@ -431,63 +457,22 @@ export default class EncryptedSyncPlugin extends Plugin {
   }
 }
 
-class StatusModal extends Modal {
-  constructor(private readonly plugin: EncryptedSyncPlugin) {
-    super(plugin.app);
-  }
-
-  override onOpen(): void {
-    const status = this.plugin.statusSummary();
-    const state = this.plugin.store.state;
-    this.titleEl.setText("Encrypted sync status");
-    const rows: Array<[string, string]> = [
-      ["Status", statusText(status)],
-      ["Details", status.message ?? "–"],
-      ["Pending local changes", String(status.pending)],
-      ["Conflicts", String(state.conflicts.length)],
-      ["Last sync", state.lastSyncTime ? new Date(state.lastSyncTime).toLocaleString() : "never"],
-      ["Last remote commit", state.lastRemoteCommit ? state.lastRemoteCommit.slice(0, 12) : "–"],
-      ["Manifest version", String(state.lastManifestVersion)],
-      ["Vault key", this.plugin.keyManager.isUnlocked ? "unlocked" : "locked"],
-    ];
-    for (const [name, value] of rows) new Setting(this.contentEl).setName(name).setDesc(value);
-    const actions = new Setting(this.contentEl);
-    actions.addButton((b) =>
-      b
-        .setButtonText("Sync now")
-        .setCta()
-        .onClick(() => {
-          this.close();
-          void this.plugin.syncCommand("full");
-        }),
-    );
-    if (state.conflicts.length > 0) {
-      actions.addButton((b) =>
-        b.setButtonText("Show conflicts").onClick(() => {
-          this.close();
-          this.plugin.openConflicts();
-        }),
-      );
-    }
-    if (status.state === "blocked") {
-      this.contentEl.createEl("p", {
-        cls: "mod-warning",
-        text: "Synchronisation was stopped to protect your local files. Check the repository on GitHub before continuing.",
-      });
-      actions.addButton((b) =>
-        b
-          .setButtonText("Retry")
-          .setWarning()
-          .onClick(async () => {
-            if (!(await confirmDialog(this.app, "Retry synchronisation?", ["Only continue if you understand why the repository changed."], "Retry", true))) return;
-            this.close();
-            void this.plugin.syncCommand("full");
-          }),
-      );
-    }
-  }
-
-  override onClose(): void {
-    this.contentEl.empty();
+function ribbonIcon(status: SyncStatus): string {
+  switch (status.state) {
+    case "syncing":
+      return "refresh-cw";
+    case "offline":
+    case "rateLimited":
+      return "cloud-off";
+    case "locked":
+      return "lock";
+    case "blocked":
+      return "shield-alert";
+    case "error":
+      return "alert-triangle";
+    case "notConfigured":
+      return "settings";
+    case "idle":
+      return status.conflicts > 0 ? "alert-triangle" : "cloud";
   }
 }

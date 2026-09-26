@@ -150,3 +150,28 @@ describe("sync controller (§17, §18, §35)", () => {
     expect(calls).toHaveLength(3);
   });
 });
+
+describe("status after sync", () => {
+  it("recounts pending changes when a sync finished", async () => {
+    let pending = 3;
+    const timers = new FakeTimers();
+    const statuses: SyncStatus[] = [];
+    const controller = new SyncController({
+      runSync: async () => {
+        pending = 0;
+        return REPORT;
+      },
+      countPending: async () => pending,
+      countConflicts: () => 0,
+      isConfigured: () => true,
+      isUnlocked: () => true,
+      settings: () => ({ autoSync: true, syncOnStartup: false, syncOnResume: true, syncAfterChanges: true, debounceSeconds: 30, intervalMinutes: 0 }),
+      timers,
+      onStatus: (s) => statuses.push(s),
+    });
+    await controller.refreshStatus();
+    expect(statuses.at(-1)?.pending).toBe(3);
+    await controller.runNow("full");
+    expect(statuses.at(-1)).toMatchObject({ state: "idle", pending: 0 });
+  });
+});

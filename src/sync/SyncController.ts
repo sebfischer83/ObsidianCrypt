@@ -202,7 +202,7 @@ export class SyncController {
       this.setStatus({ state: "idle", lastSync: this.o.timers.now(), message: null });
       this.o.onReport?.(report);
       if (report.morePending) this.scheduleRetry(1_000);
-      await this.refreshStatus();
+      await this.refreshStatus(true);
       return report;
     } catch (error: unknown) {
       await this.handleError(error);
@@ -238,7 +238,7 @@ export class SyncController {
       this.setStatus({ state: "error", message });
     }
     this.log.warn("sync failed", { retryAttempt: this.retryAttempt });
-    await this.refreshStatus();
+    await this.refreshStatus(true);
   }
 
   /** Exponential backoff for automatic retries: 30 s, 60 s, 2 min … capped at 15 min. */
@@ -262,9 +262,13 @@ export class SyncController {
     return this.pendingRefresh;
   }
 
-  async refreshStatus(): Promise<void> {
+  /**
+   * Recounts pending changes. `insideSync` = called by the sync owner itself (it holds the mutex, so
+   * counting is safe); otherwise counting is skipped while a sync runs.
+   */
+  async refreshStatus(insideSync = false): Promise<void> {
     let pending = this.status.pending;
-    if (this.o.isConfigured() && !this.mutex.isRunning) {
+    if (this.o.isConfigured() && (insideSync || !this.mutex.isRunning)) {
       try {
         pending = await this.o.countPending();
       } catch (error: unknown) {

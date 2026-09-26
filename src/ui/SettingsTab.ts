@@ -1,4 +1,6 @@
-import { Notice, PluginSettingTab, Setting, type App } from "obsidian";
+import { Notice, PluginSettingTab, Setting, type App, type ButtonComponent } from "obsidian";
+import type { SyncStatus } from "../sync/SyncController";
+import { statusRows } from "./StatusModal";
 import { MIN_PASSWORD_LENGTH } from "../crypto/KeyManager";
 import { describeError } from "../errors/VaultSyncError";
 import type EncryptedSyncPlugin from "../main";
@@ -16,11 +18,47 @@ export class SettingsTab extends PluginSettingTab {
     super(app, plugin);
   }
 
+  private unsubscribe: (() => void) | null = null;
+  private liveRows = new Map<string, Setting>();
+  private syncButton: ButtonComponent | null = null;
+  private statusSetting: Setting | null = null;
+
+  override hide(): void {
+    this.unsubscribe?.();
+    this.unsubscribe = null;
+  }
+
+  /** Updates the status parts in place (no full re-render, so text inputs keep their state). */
+  private renderLive(status: SyncStatus): void {
+    if (this.statusSetting) {
+      this.statusSetting.setName(statusText(status));
+      const state = this.plugin.store.state;
+      this.statusSetting.setDesc(
+        [status.message, state.lastSyncTime ? `Last sync: ${new Date(state.lastSyncTime).toLocaleString()}` : "Not synchronised yet"].filter(Boolean).join(" · "),
+      );
+    }
+    const syncing = status.state === "syncing";
+    this.syncButton?.setDisabled(syncing || !this.plugin.isConfigured()).setButtonText(syncing ? "Syncing…" : "Sync now");
+    for (const [name, value] of statusRows(this.plugin, status)) this.liveRows.get(name)?.setDesc(value);
+  }
+
   override display(): void {
     const { containerEl } = this;
     containerEl.empty();
+    this.unsubscribe?.();
+    this.liveRows = new Map();
     const s = this.plugin.settings;
     const save = async (): Promise<void> => this.plugin.saveSettings();
+
+    // ── Status (live) ──
+    this.statusSetting = new Setting(containerEl)
+      .addButton((b) => {
+        this.syncButton = b;
+        b.setButtonText("Sync now")
+          .setCta()
+          .onClick(() => void this.plugin.syncCommand("full"));
+      })
+      .addButton((b) => b.setButtonText("Details").onClick(() => this.plugin.openStatus()));
 
     // ── GitHub ──
     new Setting(containerEl).setName("GitHub").setHeading();
@@ -176,17 +214,10 @@ export class SettingsTab extends PluginSettingTab {
 
     // ── Diagnostics ──
     new Setting(containerEl).setName("Diagnostics").setHeading();
-    const state = this.plugin.store.state;
-    const status = this.plugin.statusSummary();
-    const rows: Array<[string, string]> = [
-      ["Status", `${statusText(status)}${status.message ? ` – ${status.message}` : ""}`],
-      ["Last sync", state.lastSyncTime ? new Date(state.lastSyncTime).toLocaleString() : "never"],
-      ["Last remote commit", state.lastRemoteCommit ?? "–"],
-      ["Pending changes", String(status.pending)],
-      ["Conflicts", String(state.conflicts.length)],
-      ["Device ID", this.plugin.deviceId],
-    ];
-    for (const [name, value] of rows) new Setting(containerEl).setName(name).setDesc(value);
+    for (const [name, value] of statusRows(this.plugin, this.plugin.statusSummary())) {
+      this.liveRows.set(name, new Setting(containerEl).setName(name).setDesc(value));
+    }
+    new Setting(containerEl).setName("Device ID").setDesc(this.plugin.deviceId);
     new Setting(containerEl).setName("Show conflicts").addButton((b) => b.setButtonText("Open").onClick(() => this.plugin.openConflicts()));
     new Setting(containerEl)
       .setName("Debug logging")
@@ -198,6 +229,9 @@ export class SettingsTab extends PluginSettingTab {
         .setDesc("Only enable when asked to for troubleshooting. File names can be sensitive.")
         .addToggle((t) => t.setValue(s.logPaths).onChange(async (v) => ((s.logPaths = v), await save())));
     }
+
+    this.renderLive(this.plugin.statusSummary());
+    this.unsubscribe = this.plugin.onStatusChange((status) => this.renderLive(status));
   }
 
   private passwordSection(containerEl: HTMLElement, unlocked: boolean): void {
