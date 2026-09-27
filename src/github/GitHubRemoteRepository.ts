@@ -1,8 +1,8 @@
 import { GitHubError } from "../errors/GitHubError";
 import { SyncError } from "../errors/SyncError";
 import { serializeVaultConfig, type PublicVaultConfig } from "../manifest/VaultConfig";
-import { armor, assertEncrypted, CONFIG_PATH, MANIFEST_PATH, objectPath, unarmor } from "../remote/RemoteLayout";
-import type { CommitMetadata, HeadState, RemoteChange, RemoteRepository } from "../remote/RemoteRepository";
+import { armor, assertEncrypted, CONFIG_PATH, MANIFEST_PATH, objectPath, parseCommitDevice, unarmor } from "../remote/RemoteLayout";
+import type { CommitMetadata, HeadState, ObjectRevision, RemoteChange, RemoteRepository } from "../remote/RemoteRepository";
 import { toBase64, utf8Decode } from "../util/bytes";
 import { ValidationError } from "../util/validate";
 import type { GitObjectsApi, TreeEntryInput } from "./GitObjectsApi";
@@ -59,6 +59,11 @@ export class GitHubRemoteRepository implements RemoteRepository {
     const stored = await this.api.getFileRaw(commit, objectPath(objectId));
     if (!stored) throw new GitHubError("NotFound", 404);
     return unarmor(stored);
+  }
+
+  async listObjectRevisions(from: string, objectId: string, limit: number): Promise<ObjectRevision[]> {
+    const commits = await this.api.listCommitsForPath(from, objectPath(objectId), limit);
+    return commits.slice(0, limit).map((c) => ({ commit: c.sha, date: c.date, device: parseCommitDevice(c.message) }));
   }
 
   async isBootstrapCommit(commit: string): Promise<boolean> {

@@ -47,3 +47,12 @@ export class PathOccupancy<T> {
     this.map.delete(pathKey(path));
   }
 }
+
+/** "Folder/Note.md" → "Folder/Note (version 2026-09-27 1430).md" (local time); `n` > 1 appends a counter. */
+export function versionCopyPath(path: string, date: number, n = 1): string {
+  const d = new Date(date);
+  const pad = (v: number): string => String(v).padStart(2, "0");
+  const stamp = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}${pad(d.getMinutes())}`;
+  const [stem, ext] = splitExtension(basename(path));
+  return joinPath(dirname(path), `${stem} (version ${stamp}${n === 1 ? "" : ` ${n}`})${ext}`);
+}

@@ -10,6 +10,7 @@ export type SyncErrorCode =
   | "UnsupportedFormatVersion"
   | "RetriesExhausted"
   | "LocalWriteFailed"
+  | "UnsyncedChanges"
   | "InvalidState";
 
 /**
@@ -48,6 +49,7 @@ const MESSAGES: Record<Exclude<SyncErrorCode, "Blocked">, string> = {
   UnsupportedFormatVersion: "Unsupported format version.",
   RetriesExhausted: "Synchronisation did not converge after several attempts; it will be retried later.",
   LocalWriteFailed: "Writing a file to the local vault failed. The previous file was kept.",
+  UnsyncedChanges: "The file has changes that are not synchronised yet. Sync first or restore the version as a copy.",
   InvalidState: "The local sync state is invalid.",
 };
 

@@ -53,3 +53,10 @@ export function buildCommitMessage(changeCount: number, deviceId: string): strin
   const noun = changeCount === 1 ? "change" : "changes";
   return `Encrypted vault sync: ${changeCount} ${noun}\n\nDevice: ${deviceId}\n`;
 }
+
+const DEVICE_TRAILER = /^Device: ([0-9a-f-]{36})$/m;
+
+/** Device id from a commit message written by {@link buildCommitMessage}, or null. */
+export function parseCommitDevice(message: string): string | null {
+  return DEVICE_TRAILER.exec(message)?.[1] ?? null;
+}

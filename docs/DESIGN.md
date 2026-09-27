@@ -307,6 +307,36 @@ GitHub sieht: Anzahl der Objekte, ungefähre Größen (Ciphertext ≈ Klartext +
 Häufigkeit von Änderungen pro Objekt, Anzahl Änderungen pro Commit, Device-IDs (zufällig).
 Padding/Chunking ist für spätere Formatversionen vorgesehen.
 
+## 7a. Versionsverlauf (Markdown-Notizen)
+
+Jeder Push schreibt `objects/<aa>/<objectId>` neu; die Object-ID bleibt über Änderungen und Renames stabil.
+Die Commits, die diesen Pfad ändern, sind damit genau die Versionen der Datei – verschlüsselt, von allen
+Geräten, ohne zusätzlichen Speicher.
+
+| Option | Vorteil | Nachteil |
+|---|---|---|
+| **Git-Historie (umgesetzt)** | keine Formatänderung, nichts zusätzlich gespeichert, geräteübergreifend, verschlüsselt | braucht Netz; Granularität = Syncs; Historie wird nie gekürzt (kein Force-Push) → Einstellung begrenzt nur die Anzeige |
+| Lokale Snapshots im Plugin-Ordner | offline, erfasst auch Stände zwischen Syncs, echte Aufbewahrungsgrenze | Klartext-Kopien außerhalb des Vaults, pro Gerät, doppelt zu Obsidians Kern-Plugin „Dateiwiederherstellung“ |
+| Versionsobjekte im Manifest | explizite Aufbewahrung | neue `formatVersion`, Migration, redundant zur Git-Historie |
+
+Ablauf (`src/sync/VersionHistory.ts`):
+
+* **Liste:** `RemoteRepository.listObjectRevisions(lastRemoteCommit, objectId, n)` → GitHub
+  `GET /commits?sha=…&path=objects/<aa>/<id>&per_page=n` (Einstellung *Versions per note*, 1–100, Default 20).
+  Die Anfrage enthält nur die Object-ID. Datum und Device-ID stammen aus Commit-Metadaten und sind **nicht**
+  authentisiert (nur Anzeige).
+* **Laden:** erst bei Vorschau/Wiederherstellung; `EncryptionEngine.decryptObjectRevision` prüft AES-GCM mit
+  `ovs/v1/object/<vaultId>/<objectId>` als AAD. Ein Manifest-Hash liegt für alte Versionen nicht vor; die AAD
+  garantiert trotzdem, dass der Inhalt mit dem Vault-Schlüssel für genau dieses Objekt verschlüsselt wurde
+  (ein unter den Pfad gelegtes fremdes Objekt schlägt fehl). Commit, der die Datei entfernt hat → „nicht verfügbar“.
+* **Wiederherstellen (ersetzen):** nur wenn der aktuelle lokale Inhalt dem Remote-Manifest (`state.remote`)
+  entspricht, also selbst in der Historie liegt. Sonst zuerst ein Sync; gelingt der nicht (offline, blockiert,
+  Konflikt) → `SyncError("UnsyncedChanges")`, nichts wird geschrieben. Unter `SyncMutex`, Object-ID wird erneut
+  geprüft. Der wiederhergestellte Inhalt ist danach eine normale lokale Änderung und wird als neue Version gepusht.
+* **Als Kopie wiederherstellen:** neue Datei `Name (version YYYY-MM-DD HHmm).md` neben dem Original; das Original
+  bleibt unberührt (auch mit nicht synchronisierten Änderungen).
+* Konfliktkopien und neu verschlüsselte Objekte erhalten neue Object-IDs; ihre Historie beginnt neu.
+
 ## 8. Grenzen von Version 1
 
 * Leere Ordner werden nicht synchronisiert.

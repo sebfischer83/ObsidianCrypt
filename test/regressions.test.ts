@@ -79,7 +79,7 @@ describe("review regressions", () => {
     const files = new Map(remote.commits.get(head)?.files);
     files.set(MANIFEST_PATH, oldManifest);
     const forged = "f".repeat(40);
-    remote.commits.set(forged, { sha: forged, parent: head, files, message: "Encrypted vault sync: 1 change" });
+    remote.commits.set(forged, { sha: forged, parent: head, files, message: "Encrypted vault sync: 1 change", date: 0 });
     remote.forceSetHead(forged);
     const error = await b.sync().catch((e: unknown) => e);
     expect(error).toBeInstanceOf(SyncError);

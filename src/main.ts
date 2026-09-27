@@ -1,4 +1,4 @@
-import { Notice, Plugin, setIcon, TAbstractFile, TFolder } from "obsidian";
+import { Notice, Plugin, setIcon, TAbstractFile, TFile, TFolder } from "obsidian";
 import { WebCryptoProvider } from "./crypto/WebCryptoProvider";
 import { KeyManager, MIN_PASSWORD_LENGTH, unlockWithPassword, VaultKeys } from "./crypto/KeyManager";
 import { CryptoError } from "./errors/CryptoError";
@@ -17,6 +17,7 @@ import { FileStateRepository } from "./state/StateRepository";
 import { SyncStateStore } from "./state/SyncStateStore";
 import { SyncController, type SyncStatus } from "./sync/SyncController";
 import { SyncEngine, type SyncMode, type SyncReport } from "./sync/SyncEngine";
+import { VersionHistory, type FileVersion, type RestoreOutcome } from "./sync/VersionHistory";
 import {
   changeVaultPassword,
   connectExistingVault,
@@ -39,6 +40,7 @@ import { SetupWizard } from "./ui/SetupWizard";
 import { openChangePasswordModal, promptVaultSecret, showRecoveryKey } from "./ui/Modals";
 import { StatusModal } from "./ui/StatusModal";
 import { StatusBar, statusText } from "./ui/StatusBar";
+import { VersionHistoryModal } from "./ui/VersionHistoryModal";
 
 const DEVICE_ID_KEY = "encrypted-github-sync-device-id";
 const MIB = 1024 * 1024;
@@ -324,6 +326,38 @@ export default class EncryptedSyncPlugin extends Plugin {
     await showRecoveryKey(this.app, key);
   }
 
+  // ───────────────────────── version history ─────────────────────────
+
+  versionHistory(): VersionHistory {
+    return new VersionHistory({ crypto: this.crypto, fs: this.fs, remote: this.buildRemote(), store: this.store, getKeys: () => this.keyManager.keys });
+  }
+
+  async openVersionHistory(file: TFile): Promise<void> {
+    if (!this.isConfigured()) {
+      new Notice("Encrypted sync is not set up yet.");
+      return;
+    }
+    if (!this.keyManager.isUnlocked && !(await this.promptUnlock())) return;
+    new VersionHistoryModal(this, file.path).open();
+  }
+
+  /** Replaces a note's content with an earlier version without ever losing the current content. */
+  async restoreVersion(path: string, version: FileVersion, content: Uint8Array): Promise<RestoreOutcome> {
+    const history = this.versionHistory();
+    // Unsynced current content is pushed first so it becomes a version itself; if that does not happen
+    // (offline, blocked, conflict), restore() refuses and the user can restore as a copy instead.
+    if (!(await history.isCurrentContentSynced(path, version.objectId))) await this.controller.runNow("full");
+    const outcome = await this.controller.runExclusive(() => history.restore(path, version, content));
+    this.controller.notifyChange();
+    return outcome;
+  }
+
+  async restoreVersionAsCopy(path: string, version: FileVersion, content: Uint8Array): Promise<string> {
+    const copy = await this.versionHistory().restoreAsCopy(path, version, content);
+    this.controller.notifyChange();
+    return copy;
+  }
+
   async dismissConflict(id: string): Promise<void> {
     this.store.state.conflicts = this.store.state.conflicts.filter((c) => c.id !== id);
     await this.store.persist();
@@ -384,6 +418,27 @@ export default class EncryptedSyncPlugin extends Plugin {
     this.addCommand({ id: "unlock", name: "Unlock vault", callback: () => void this.promptUnlock() });
     this.addCommand({ id: "change-password", name: "Change password", callback: () => this.openChangePassword() });
     this.addCommand({ id: "setup", name: "Set up / connect repository", callback: () => new SetupWizard(this.app, this).open() });
+    this.addCommand({
+      id: "show-version-history",
+      name: "Show version history of current note",
+      checkCallback: (checking) => {
+        const file = this.app.workspace.getActiveFile();
+        if (!file || file.extension !== "md") return false;
+        if (!checking) void this.openVersionHistory(file);
+        return true;
+      },
+    });
+    this.registerEvent(
+      this.app.workspace.on("file-menu", (menu, file) => {
+        if (!(file instanceof TFile) || file.extension !== "md") return;
+        menu.addItem((item) =>
+          item
+            .setTitle("Version history")
+            .setIcon("history")
+            .onClick(() => void this.openVersionHistory(file)),
+        );
+      }),
+    );
   }
 
   private openChangePassword(): void {

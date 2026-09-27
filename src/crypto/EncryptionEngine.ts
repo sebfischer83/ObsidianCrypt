@@ -44,6 +44,16 @@ export class EncryptionEngine {
     return plaintext;
   }
 
+  /**
+   * Decrypts an older version of an object from the remote history. No manifest hash is available for
+   * it; AES-GCM with the vault and object id in the AAD still guarantees that the content was encrypted
+   * with this vault's key for exactly this object.
+   */
+  async decryptObjectRevision(objectId: string, envelope: Uint8Array): Promise<Uint8Array> {
+    assertObjectId(objectId);
+    return openEnvelope(this.crypto, this.keys.objectKey, EnvelopeKind.Object, envelope, Contexts.object(this.keys.vaultId, objectId));
+  }
+
   async encryptManifest(plaintext: Uint8Array): Promise<EncryptedBlob> {
     return sealEnvelope(this.crypto, this.keys.manifestKey, EnvelopeKind.Manifest, plaintext, Contexts.manifest(this.keys.vaultId));
   }

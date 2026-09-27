@@ -83,6 +83,19 @@ export class GitObjectsApi {
     };
   }
 
+  /** Commits reachable from `from` that touched `path`, newest first (GitHub caps `perPage` at 100). */
+  async listCommitsForPath(from: string, path: string, perPage: number): Promise<Array<{ sha: string; date: number; message: string }>> {
+    const query = `sha=${sha(from)}&path=${encodeURIComponent(path)}&per_page=${Math.min(100, Math.max(1, Math.floor(perPage)))}`;
+    const { data } = await this.client.json<unknown>("GET", `${this.repoPath}/commits?${query}`);
+    return expectArray(data, "commits").map((c) => {
+      const record = expectRecord(c, "commit");
+      const commit = expectRecord(record.commit, "commit.commit");
+      const date = Date.parse(expectString(expectRecord(commit.committer, "commit.committer").date, "commit.committer.date"));
+      if (!Number.isFinite(date)) throw new GitHubError("InvalidResponse");
+      return { sha: expectString(record.sha, "commit.sha", GIT_SHA), date, message: expectString(commit.message, "commit.message") };
+    });
+  }
+
   /** Raw file content at a commit, or null if the path does not exist. */
   async getFileRaw(commit: string, path: string): Promise<Uint8Array | null> {
     const response = await this.client.raw(`${this.repoPath}/contents/${encodePath(path)}?ref=${sha(commit)}`, { allow: [404] });

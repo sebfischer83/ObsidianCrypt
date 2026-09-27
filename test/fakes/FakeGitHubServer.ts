@@ -6,6 +6,7 @@ interface CommitObject {
   readonly tree: string;
   readonly parents: string[];
   readonly message: string;
+  readonly date: number;
 }
 
 export interface InjectedFailure {
@@ -46,6 +47,11 @@ export class FakeGitHubServer implements HttpClient {
 
   private hash(kind: string, data: Uint8Array): string {
     return toHex(sha256(new Uint8Array([...utf8Encode(`${kind} ${data.length}\0`), ...data]))).slice(0, 40);
+  }
+
+  /** Commit timestamps: one minute apart, deterministic. */
+  private commitDate(): number {
+    return 1_790_000_000_000 + this.commits.size * 60_000;
   }
 
   private putBlob(data: Uint8Array): string {
@@ -133,6 +139,25 @@ export class FakeGitHubServer implements HttpClient {
       if (!blobSha) return this.json(404, { message: "Not Found" });
       return { status: 200, headers: {}, body: (this.blobs.get(blobSha) as Uint8Array).slice() };
     }
+    if (req.method === "GET" && path === "/commits") {
+      // History of one path along first parents (our history is linear), newest first.
+      const start = url.searchParams.get("sha") ?? "";
+      const filePath = url.searchParams.get("path") ?? "";
+      const perPage = Math.min(100, Number(url.searchParams.get("per_page") ?? "30"));
+      let sha: string | undefined = this.commits.has(start) ? start : this.refs.get(start);
+      if (!sha) return this.json(404, { message: "Not Found" });
+      const out: unknown[] = [];
+      while (sha && out.length < perPage) {
+        const c = this.commits.get(sha) as CommitObject;
+        const parent = c.parents[0];
+        const before = parent ? this.trees.get((this.commits.get(parent) as CommitObject).tree)?.get(filePath) : undefined;
+        if (this.trees.get(c.tree)?.get(filePath) !== before) {
+          out.push({ sha, commit: { message: c.message, committer: { date: new Date(c.date).toISOString() } }, parents: c.parents.map((p) => ({ sha: p })) });
+        }
+        sha = parent;
+      }
+      return this.json(200, out);
+    }
     if (req.method === "GET" && (m = path.match(/^\/compare\/([0-9a-f]{40})\.\.\.([0-9a-f]{40})$/))) {
       const [base, head] = [m[1] as string, m[2] as string];
       if (!this.commits.has(base) || !this.commits.has(head)) return this.json(404, {});
@@ -147,7 +172,7 @@ export class FakeGitHubServer implements HttpClient {
       const blob = this.putBlob(fromBase64(body.content as string));
       const tree = this.putTree(new Map([[m[1] as string, blob]]));
       const sha = this.hash("commit", utf8Encode(`${tree}|${String(body.message)}|root`));
-      this.commits.set(sha, { tree, parents: [], message: String(body.message) });
+      this.commits.set(sha, { tree, parents: [], message: String(body.message), date: this.commitDate() });
       this.refs.set((body.branch as string) ?? "main", sha);
       return this.json(201, { commit: { sha } });
     }
@@ -176,7 +201,7 @@ export class FakeGitHubServer implements HttpClient {
       const parents = body.parents as string[];
       if (!this.trees.has(tree) || parents.some((p) => !this.commits.has(p))) return this.json(422, {});
       const sha = this.hash("commit", utf8Encode(`${tree}|${parents.join(",")}|${String(body.message)}|${this.commits.size}`));
-      this.commits.set(sha, { tree, parents, message: String(body.message) });
+      this.commits.set(sha, { tree, parents, message: String(body.message), date: this.commitDate() });
       return this.json(201, { sha });
     }
     if (req.method === "POST" && path === "/git/refs") {

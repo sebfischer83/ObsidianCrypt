@@ -5,6 +5,7 @@ import { MIN_PASSWORD_LENGTH } from "../crypto/KeyManager";
 import { describeError } from "../errors/VaultSyncError";
 import type EncryptedSyncPlugin from "../main";
 import { MAX_FILE_SIZE_MB_LIMIT } from "../settings";
+import { MAX_VERSION_LIMIT } from "../sync/VersionHistory";
 import { IGNORE_FILE } from "../vault/SyncFilter";
 import { confirmDialog } from "./Modals";
 import { SetupWizard } from "./SetupWizard";
@@ -210,6 +211,21 @@ export class SettingsTab extends PluginSettingTab {
             await save();
           }
         }),
+      );
+
+    // ── Version history ──
+    new Setting(containerEl).setName("Version history").setHeading();
+    new Setting(containerEl)
+      .setName("Versions per note")
+      .setDesc(
+        `How many earlier versions of a Markdown note can be restored (1–${MAX_VERSION_LIMIT}). Versions are read from the encrypted GitHub history (one per sync that changed the note); nothing is stored additionally and older versions are never deleted there.`,
+      )
+      .addSlider((sl) =>
+        sl
+          .setLimits(1, MAX_VERSION_LIMIT, 1)
+          .setValue(s.versionHistoryLimit)
+          .setDynamicTooltip()
+          .onChange(async (v) => ((s.versionHistoryLimit = v), await save())),
       );
 
     // ── Diagnostics ──

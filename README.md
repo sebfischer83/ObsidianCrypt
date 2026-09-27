@@ -73,11 +73,16 @@ Requires Obsidian 1.11.4 or newer. Do not use a second sync tool for the same va
 
 * Syncs on startup, ~30 s after the last change, on app resume and optionally every 1–60 minutes.
 * Commands: *Sync now*, *Pull from GitHub*, *Push to GitHub* (always pulls and merges first), *Show status*,
-  *Show conflicts*, *Lock vault*, *Unlock vault*, *Change password*.
+  *Show conflicts*, *Lock vault*, *Unlock vault*, *Change password*, *Show version history of current note*.
 * Status bar: `☁ Synced`, `☁ 4 pending`, `↻ Syncing`, `☁ Offline · 37 pending`, `⚠ 2 conflicts`, `⚠ Sync error`.
 * **Conflicts** never lose data: if a note was changed on two devices, the remote version keeps the name and
   your version is saved as `Note (conflict 2026-09-26 1a2b3c4d).md`. Delete-vs-modify always keeps the
   modified version. Remote deletions move files to the vault’s `.trash` folder.
+* **Version history** for Markdown notes: *Version history* in the file menu or the command *Show version
+  history of current note* lists earlier versions (setting *Versions per note*, 1–100, default 20), with
+  preview, *Restore* and *Restore as copy*. Versions are decrypted from the encrypted GitHub history – one
+  per sync that changed the note, from every device – so nothing extra is stored. Restoring never loses the
+  current content: unsynced changes are synced first (or the restore is refused and a copy can be made).
 * `.vaultsyncignore` (gitignore-like) excludes files before encryption. `.obsidian` sync is configurable
   (core settings on by default; plugins, themes/snippets and workspace separately).
 * If the repository was manipulated (force-push, deleted branch, corrupted manifest, foreign vault, newer
@@ -111,5 +116,7 @@ Test suites:
   manipulation; password change and recovery.
 * `security.test.ts` / `github.test.ts` – scans everything stored remotely and every request sent to the
   (emulated) GitHub API for plaintext contents, file and folder names.
+* `history.test.ts` – version listing across devices and renames, restore (only when the current content is
+  in the history), restore as copy, deleted versions, planted foreign objects, GitHub API requests.
 * `fuzz.test.ts` – randomised two-device sessions (optionally with crashes, restarts and network drops)
   checking that local content is never lost and that devices converge (`FUZZ_SEEDS=400 npm test`).

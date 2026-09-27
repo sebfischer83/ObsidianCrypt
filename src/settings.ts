@@ -1,6 +1,7 @@
 import type { PasswordKdfAlgorithm } from "./crypto/KeyDerivation";
 import { DEFAULT_LIMITS, HARD_MAX_FILE_SIZE } from "./sync/SyncEngine";
 import type { TriggerSettings } from "./sync/SyncController";
+import { MAX_VERSION_LIMIT } from "./sync/VersionHistory";
 import { isRecord } from "./util/validate";
 
 /**
@@ -23,6 +24,8 @@ export interface PluginSettings extends TriggerSettings {
   syncThemesAndSnippets: boolean;
   syncWorkspace: boolean;
   maxFileSizeMB: number;
+  /** How many earlier versions the version history lists per file. */
+  versionHistoryLimit: number;
   /** Keep the vault master key in the OS keychain so syncing works without re-entering the password. */
   rememberKey: boolean;
   kdfForNewVaults: PasswordKdfAlgorithm;
@@ -47,6 +50,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   syncThemesAndSnippets: false,
   syncWorkspace: false,
   maxFileSizeMB: DEFAULT_LIMITS.maxFileSize / (1024 * 1024),
+  versionHistoryLimit: 20,
   rememberKey: true,
   kdfForNewVaults: "argon2id",
   debugLogging: false,
@@ -66,6 +70,7 @@ export function loadSettings(raw: unknown): PluginSettings {
   settings.debounceSeconds = clamp(settings.debounceSeconds, 5, 3600);
   settings.intervalMinutes = settings.intervalMinutes === 0 ? 0 : clamp(settings.intervalMinutes, 1, 60);
   settings.maxFileSizeMB = clamp(settings.maxFileSizeMB, 1, MAX_FILE_SIZE_MB_LIMIT);
+  settings.versionHistoryLimit = clamp(settings.versionHistoryLimit, 1, MAX_VERSION_LIMIT);
   if (settings.kdfForNewVaults !== "argon2id" && settings.kdfForNewVaults !== "pbkdf2-sha256") settings.kdfForNewVaults = "argon2id";
   return settings;
 }

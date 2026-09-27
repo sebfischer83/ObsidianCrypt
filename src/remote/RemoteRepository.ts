@@ -22,6 +22,15 @@ export type RemoteChange =
   | { readonly kind: "putManifest"; readonly blob: EncryptedBlob }
   | { readonly kind: "putConfig"; readonly config: PublicVaultConfig };
 
+/** A commit that wrote (or removed) an object's remote file. */
+export interface ObjectRevision {
+  readonly commit: string;
+  /** Committer time (ms). Commit metadata is NOT authenticated: informational only. */
+  readonly date: number;
+  /** Device id from the commit message trailer (informational, not authenticated). */
+  readonly device: string | null;
+}
+
 export interface CommitMetadata {
   /** Must not contain file names or other vault data. */
   readonly message: string;
@@ -39,6 +48,12 @@ export interface RemoteRepository {
 
   /** Encrypted object envelope at a commit. Throws GitHubError("NotFound") if missing. */
   readObject(commit: string, objectId: string): Promise<Uint8Array>;
+
+  /**
+   * Commits reachable from `from` (newest first, at most `limit`) that changed the object's remote file.
+   * Only the object id is involved, so no vault data is revealed.
+   */
+  listObjectRevisions(from: string, objectId: string, limit: number): Promise<ObjectRevision[]>;
 
   /** True if the commit's tree contains nothing but `.vaultsync/config` (freshly initialised vault). */
   isBootstrapCommit(commit: string): Promise<boolean>;
