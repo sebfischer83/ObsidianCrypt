@@ -1,6 +1,6 @@
 {
   "name": "obsidian-encrypted-github-sync",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "End-to-end encrypted synchronisation of an Obsidian vault with a GitHub repository.",
   "main": "main.js",
   "private": true,
