@@ -1,6 +1,7 @@
 import type { EncryptionEngine } from "../crypto/EncryptionEngine";
 import { envelopeKind, EnvelopeKind } from "../crypto/EncryptionFormat";
 import { CryptoError } from "../errors/CryptoError";
+import type { LiveEntry } from "../manifest/Manifest";
 import { MAX_CHUNKS } from "../manifest/ManifestCodec";
 import type { RemoteChange, RemoteRepository } from "../remote/RemoteRepository";
 import { utf8Decode, utf8Encode } from "../util/bytes";
@@ -144,4 +145,10 @@ export async function encodeObject(o: EncodeOptions, objectId: string, data: Uin
   }
   changes.push({ kind: "putObject", objectId, blob: await o.engine.encryptChunkIndex(objectId, encodeChunkIndex(refs)) });
   return { changes, chunks: refs.length, uploadedChunks };
+}
+
+/** The entry with the given chunk count (undefined = single object). */
+export function withChunks(entry: LiveEntry, chunks: number | undefined): LiveEntry {
+  const { chunks: _previous, ...rest } = entry;
+  return chunks === undefined ? rest : { ...rest, chunks };
 }

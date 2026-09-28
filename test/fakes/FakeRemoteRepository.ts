@@ -1,7 +1,7 @@
 import { GitHubError } from "../../src/errors/GitHubError";
 import { SyncError } from "../../src/errors/SyncError";
 import { serializeVaultConfig, type PublicVaultConfig } from "../../src/manifest/VaultConfig";
-import { assertEncrypted, CONFIG_PATH, MANIFEST_PATH, objectIdFromPath, objectPath, parseCommitDevice } from "../../src/remote/RemoteLayout";
+import { assertEncrypted, CONFIG_PATH, isMigrationMessage, MANIFEST_PATH, objectIdFromPath, objectPath, parseCommitDevice } from "../../src/remote/RemoteLayout";
 import type { CommitMetadata, HeadState, ObjectRevision, RemoteChange, RemoteRepository } from "../../src/remote/RemoteRepository";
 import { toHex } from "../../src/util/bytes";
 import type { EncryptedBlob } from "../../src/crypto/EncryptionFormat";
@@ -100,7 +100,7 @@ export class FakeRemoteRepository implements RemoteRepository {
     while (current && out.length < limit) {
       const parent: Commit | undefined = current.parent ? this.commit(current.parent) : undefined;
       if (!sameBytes(current.files.get(path), parent?.files.get(path))) {
-        out.push({ commit: current.sha, date: current.date, device: parseCommitDevice(current.message) });
+        out.push({ commit: current.sha, date: current.date, device: parseCommitDevice(current.message), migration: isMigrationMessage(current.message) });
       }
       current = parent;
     }

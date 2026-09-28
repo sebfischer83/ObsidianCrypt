@@ -31,6 +31,8 @@ export interface ObjectRevision {
   readonly date: number;
   /** Device id from the commit message trailer (informational, not authenticated). */
   readonly device: string | null;
+  /** Written by a vault migration (copy of the archive's last version, not a change of its own). */
+  readonly migration: boolean;
 }
 
 export interface CommitMetadata {

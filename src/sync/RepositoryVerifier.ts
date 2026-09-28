@@ -6,11 +6,10 @@ import { GitHubError } from "../errors/GitHubError";
 import { SyncError } from "../errors/SyncError";
 import { describeError } from "../errors/VaultSyncError";
 import { liveEntries } from "../manifest/Manifest";
-import { parseVaultConfig } from "../manifest/VaultConfig";
 import type { RemoteRepository } from "../remote/RemoteRepository";
 import type { SyncStateStore } from "../state/SyncStateStore";
 import { readChunkIndex, readObjectContent } from "./ChunkedContent";
-import { readManifestAt } from "./HistoryReader";
+import { readVerifiedHead } from "./HistoryReader";
 import { HARD_MAX_FILE_SIZE } from "./SyncEngine";
 
 export interface VerifyProblem {
@@ -61,17 +60,7 @@ export class RepositoryVerifier {
 
     const head = await this.o.remote.getHead();
     if (head.kind !== "ok") throw state.lastRemoteCommit ? SyncError.blocked("BranchDeleted") : new SyncError("NotConfigured", "remote branch not initialised");
-    const commit = head.commit;
-
-    const configBytes = await this.o.remote.readConfig(commit);
-    if (!configBytes) throw SyncError.blocked("ConfigMissing");
-    const config = parseVaultConfig(configBytes);
-    if (config.vaultId !== state.vaultId) throw SyncError.blocked("ForeignVault");
-    if (!(await keys.verifyConfigMac(this.o.crypto, config))) throw SyncError.blocked("ConfigCorrupted");
-
-    const manifest = await readManifestAt(this.o.remote, engine, commit);
-    const parents = await this.o.remote.getParents(commit);
-    if (parents.length !== 1 || parents[0] !== manifest.parentCommit) throw SyncError.blocked("HistoryRewritten");
+    const { commit, manifest } = await readVerifiedHead(this.o.remote, this.o.crypto, keys, state.deviceId);
     if (state.lastRemoteCommit && !(await this.o.remote.isAncestor(state.lastRemoteCommit, commit))) throw SyncError.blocked("HistoryRewritten");
 
     const files = liveEntries(manifest).sort((a, b) => (a[1].path < b[1].path ? -1 : 1));

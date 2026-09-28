@@ -1,4 +1,5 @@
-import { Modal, Setting } from "obsidian";
+import { Modal, Notice, Setting } from "obsidian";
+import { describeError } from "../errors/VaultSyncError";
 import type EncryptedSyncPlugin from "../main";
 import type { SyncStatus } from "../sync/SyncController";
 import { confirmDialog } from "./Modals";
@@ -68,6 +69,27 @@ export class StatusModal extends Modal {
           this.plugin.openConflicts();
         }),
       );
+    }
+    const moved = this.plugin.store.state.movedTo;
+    if (moved) {
+      contentEl.createEl("p", {
+        cls: "mod-warning",
+        text: `This vault moved to ${moved.owner}/${moved.repo} (branch ${moved.branch}). The current repository is only an archive now. Your local files were not touched; unsynchronised changes are uploaded to the new repository after switching.`,
+      });
+      actions.addButton((b) =>
+        b
+          .setButtonText("Switch to new repository")
+          .setCta()
+          .onClick(async () => {
+            try {
+              await this.plugin.followVaultMove();
+              new Notice(`Now synchronising with ${moved.owner}/${moved.repo}.`);
+            } catch (error: unknown) {
+              new Notice(`Switching failed: ${describeError(error)} – the access token may need access to the new repository.`, 12000);
+            }
+          }),
+      );
+      return;
     }
     if (status.state === "blocked") {
       contentEl.createEl("p", {

@@ -10,6 +10,7 @@ import { readObjectContent } from "./ChunkedContent";
 import { restoredPath } from "./ConflictNaming";
 import { readManifestAt } from "./HistoryReader";
 import { HARD_MAX_FILE_SIZE } from "./SyncEngine";
+import type { HistorySource } from "./VersionHistory";
 
 export interface DeletedFile {
   readonly objectId: string;
@@ -25,6 +26,8 @@ export interface ResolvedDeletedFile extends DeletedFile {
   readonly contentCommit: string;
   /** Time of the deleting commit (commit metadata: informational only). */
   readonly deletedAt: number;
+  /** 0 = current repository, n = n-th archived repository. */
+  readonly source: number;
 }
 
 export interface DeletedFilesOptions {
@@ -33,6 +36,8 @@ export interface DeletedFilesOptions {
   readonly remote: RemoteRepository;
   readonly store: SyncStateStore;
   readonly getKeys: () => VaultKeys;
+  /** Earlier repositories of a moved vault, newest first. */
+  readonly archives?: readonly HistorySource[];
 }
 
 /**
@@ -60,19 +65,32 @@ export class DeletedFiles {
   async resolve(file: DeletedFile): Promise<ResolvedDeletedFile | null> {
     const from = this.o.store.state.lastRemoteCommit;
     if (!from) return null;
-    const [deletion] = await this.o.remote.listObjectRevisions(from, file.objectId, 1);
-    if (!deletion) return null;
-    const parents = await this.o.remote.getParents(deletion.commit);
-    if (parents.length !== 1) return null;
-    const contentCommit = parents[0] as string;
-    const entry = (await this.manifestAt(contentCommit)).entries[file.objectId];
-    if (!isLive(entry)) return null;
-    return { ...file, path: entry.path, size: entry.size, contentHash: entry.contentHash, contentCommit, deletedAt: deletion.date };
+    const sources = this.sources(from);
+    for (const [index, source] of sources.entries()) {
+      let deletion;
+      try {
+        [deletion] = await source.remote.listObjectRevisions(source.from, file.objectId, 1);
+      } catch (error: unknown) {
+        if (index === 0) throw error;
+        return null;
+      }
+      // Never existed here (deleted before the vault moved) or only touched by the move: look further back.
+      if (!deletion || deletion.migration) continue;
+      const parents = await source.remote.getParents(deletion.commit);
+      if (parents.length !== 1) return null;
+      const contentCommit = parents[0] as string;
+      const entry = (await this.manifestAt(index, source.remote, contentCommit)).entries[file.objectId];
+      if (!isLive(entry)) return null;
+      return { ...file, path: entry.path, size: entry.size, contentHash: entry.contentHash, contentCommit, deletedAt: deletion.date, source: index };
+    }
+    return null;
   }
 
   /** Decrypted content, verified against the manifest hash. */
   async load(file: ResolvedDeletedFile): Promise<Uint8Array> {
-    return readObjectContent(this.o.remote, this.engine(), file.contentCommit, file.objectId, file.contentHash, HARD_MAX_FILE_SIZE);
+    const source = this.sources(this.o.store.state.lastRemoteCommit ?? "")[file.source];
+    if (!source) throw new SyncError("InvalidState", "archive repository no longer known");
+    return readObjectContent(source.remote, this.engine(), file.contentCommit, file.objectId, file.contentHash, HARD_MAX_FILE_SIZE);
   }
 
   /** Writes the content at its old path, or next to it if that path is taken. Returns the path used. */
@@ -86,14 +104,19 @@ export class DeletedFiles {
     throw new SyncError("InvalidState", "no free file name for the restored file");
   }
 
-  private manifestAt(commit: string): Promise<Manifest> {
-    let pending = this.manifests.get(commit);
+  private manifestAt(source: number, remote: RemoteRepository, commit: string): Promise<Manifest> {
+    const key = `${source}:${commit}`;
+    let pending = this.manifests.get(key);
     if (!pending) {
-      pending = readManifestAt(this.o.remote, this.engine(), commit);
-      pending.catch(() => this.manifests.delete(commit));
-      this.manifests.set(commit, pending);
+      pending = readManifestAt(remote, this.engine(), commit);
+      pending.catch(() => this.manifests.delete(key));
+      this.manifests.set(key, pending);
     }
     return pending;
+  }
+
+  private sources(from: string): HistorySource[] {
+    return [{ remote: this.o.remote, from }, ...(this.o.archives ?? [])];
   }
 
   private engine(): EncryptionEngine {

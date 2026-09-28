@@ -2,6 +2,7 @@ import { SyncError } from "../errors/SyncError";
 import { utf8Decode, utf8Encode } from "../util/bytes";
 import { canonicalJson } from "../util/canonicalJson";
 import {
+  expectArray,
   expectInteger,
   expectLiteral,
   expectOnlyKeys,
@@ -14,7 +15,7 @@ import {
   ValidationError,
 } from "../util/validate";
 import { isValidVaultPath, pathKey } from "../vault/PathUtils";
-import { MANIFEST_FORMAT_VERSION, MANIFEST_TYPE, type Manifest, type ManifestEntry } from "./Manifest";
+import { MANIFEST_TYPE, MAX_MANIFEST_FORMAT_VERSION, MOVE_FORMAT_VERSION, type ArchivedRepo, type Manifest, type ManifestEntry, type RepoLocation } from "./Manifest";
 
 export const MAX_MANIFEST_ENTRIES = 1_000_000;
 /** Upper bound for the chunk count of one file (far above HARD_MAX_FILE_SIZE / chunk size). */
@@ -49,8 +50,10 @@ export function parseManifestObject(raw: unknown, expectedVaultId: string): Mani
   const record = expectRecord(raw, "manifest");
   expectLiteral(record.type, MANIFEST_TYPE, "manifest.type");
   const formatVersion = expectInteger(record.formatVersion, "manifest.formatVersion", 1);
-  if (formatVersion > MANIFEST_FORMAT_VERSION) throw SyncError.blocked("UnknownFormatVersion");
-  expectOnlyKeys(record, ["type", "formatVersion", "vaultId", "version", "parentCommit", "device", "updatedAt", "entries"], "manifest");
+  if (formatVersion > MAX_MANIFEST_FORMAT_VERSION) throw SyncError.blocked("UnknownFormatVersion");
+  expectOnlyKeys(record, ["type", "formatVersion", "vaultId", "version", "parentCommit", "device", "updatedAt", "entries", "movedTo", "movedFrom"], "manifest");
+  const hasMoveFields = record.movedTo !== undefined || record.movedFrom !== undefined;
+  if (hasMoveFields && formatVersion < MOVE_FORMAT_VERSION) throw new ValidationError("manifest.formatVersion", "move fields need format 3");
   const vaultId = expectString(record.vaultId, "manifest.vaultId", HEX_32);
   if (vaultId !== expectedVaultId) throw SyncError.blocked("ForeignVault");
   const parentCommit = record.parentCommit === null ? null : expectString(record.parentCommit, "manifest.parentCommit", GIT_SHA);
@@ -71,7 +74,7 @@ export function parseManifestObject(raw: unknown, expectedVaultId: string): Mani
     entries[id] = entry;
   }
 
-  return {
+  const manifest: Manifest = {
     type: MANIFEST_TYPE,
     formatVersion,
     vaultId,
@@ -81,6 +84,32 @@ export function parseManifestObject(raw: unknown, expectedVaultId: string): Mani
     updatedAt: expectInteger(record.updatedAt, "manifest.updatedAt", 0),
     entries,
   };
+  const movedTo = record.movedTo === undefined ? undefined : parseRepoLocation(record.movedTo, "manifest.movedTo");
+  const movedFrom =
+    record.movedFrom === undefined
+      ? undefined
+      : expectArray(record.movedFrom, "manifest.movedFrom").map((value, i): ArchivedRepo => {
+          const r = expectRecord(value, `manifest.movedFrom.${i}`);
+          expectOnlyKeys(r, ["owner", "repo", "branch", "commit"], `manifest.movedFrom.${i}`);
+          return { ...parseRepoLocation({ owner: r.owner, repo: r.repo, branch: r.branch }, `manifest.movedFrom.${i}`), commit: expectString(r.commit, `manifest.movedFrom.${i}.commit`, GIT_SHA) };
+        });
+  if (movedFrom && movedFrom.length > 100) throw new ValidationError("manifest.movedFrom", "too many archives");
+  return { ...manifest, ...(movedTo ? { movedTo } : {}), ...(movedFrom ? { movedFrom } : {}) };
+}
+
+const OWNER = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
+const REPO = /^[A-Za-z0-9._-]{1,100}$/;
+const BRANCH = /^[A-Za-z0-9._/-]{1,250}$/;
+
+/** A GitHub repository location (strict: it is used to build API URLs). */
+export function parseRepoLocation(value: unknown, field: string): RepoLocation {
+  const r = expectRecord(value, field);
+  expectOnlyKeys(r, ["owner", "repo", "branch"], field);
+  const owner = expectString(r.owner, `${field}.owner`, OWNER);
+  const repo = expectString(r.repo, `${field}.repo`, REPO);
+  const branch = expectString(r.branch, `${field}.branch`, BRANCH);
+  if (repo === "." || repo === ".." || branch.includes("..")) throw new ValidationError(field, "invalid location");
+  return { owner, repo, branch };
 }
 
 /** Parses a record of entries without cross-entry checks (used for the per-object merge base). */

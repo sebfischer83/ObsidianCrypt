@@ -17,9 +17,17 @@ export const MAX_VERSION_LIMIT = 100;
 
 export interface FileVersion extends ObjectRevision {
   readonly objectId: string;
+  /** 0 = current repository, n = n-th archived repository. */
+  readonly source: number;
 }
 
 export type RestoreOutcome = "restored" | "unchanged";
+
+/** A repository to read history from, up to commit `from`. */
+export interface HistorySource {
+  readonly remote: RemoteRepository;
+  readonly from: string;
+}
 
 export interface VersionHistoryOptions {
   readonly crypto: CryptoProvider;
@@ -28,6 +36,8 @@ export interface VersionHistoryOptions {
   readonly store: SyncStateStore;
   /** Returns the unlocked keys or throws CryptoError("Locked"). */
   readonly getKeys: () => VaultKeys;
+  /** Earlier repositories of a moved vault, newest first (state.remote.movedFrom). */
+  readonly archives?: readonly HistorySource[];
 }
 
 /**
@@ -53,21 +63,43 @@ export class VersionHistory {
     const objectId = this.objectIdFor(path);
     if (!from || !objectId) return [];
     const bounded = Math.min(MAX_VERSION_LIMIT, Math.max(1, Math.floor(limit)));
-    const revisions = await this.o.remote.listObjectRevisions(from, objectId, bounded);
-    return revisions.slice(0, bounded).map((r) => ({ ...r, objectId }));
+    const sources = this.sources(from);
+    const out: FileVersion[] = [];
+    for (const [index, source] of sources.entries()) {
+      if (out.length >= bounded) break;
+      let revisions: ObjectRevision[];
+      try {
+        revisions = await source.remote.listObjectRevisions(source.from, objectId, bounded);
+      } catch (error: unknown) {
+        // An archive that is gone or not accessible only shortens the list.
+        if (index === 0) throw error;
+        break;
+      }
+      const hasOlder = index < sources.length - 1;
+      // A migration commit only repeats the archive's last version.
+      for (const r of revisions) if (!(r.migration && hasOlder)) out.push({ ...r, objectId, source: index });
+    }
+    return out.slice(0, bounded);
   }
 
   /** Decrypted content of a version, or null if the file was removed in that commit. */
   async load(version: FileVersion): Promise<Uint8Array | null> {
     const keys = this.o.getKeys();
     if (keys.vaultId !== this.o.store.state.vaultId) throw SyncError.blocked("ForeignVault");
+    const source = this.sources(this.o.store.state.lastRemoteCommit ?? "")[version.source];
+    if (!source) throw new SyncError("InvalidState", "archive repository no longer known");
     const engine = new EncryptionEngine(this.o.crypto, keys);
     try {
-      return await readObjectContent(this.o.remote, engine, version.commit, version.objectId, null, HARD_MAX_FILE_SIZE);
+      return await readObjectContent(source.remote, engine, version.commit, version.objectId, null, HARD_MAX_FILE_SIZE);
     } catch (error: unknown) {
       if (error instanceof GitHubError && error.category === "NotFound") return null;
       throw error;
     }
+  }
+
+  /** The current repository followed by archived ones (earlier repositories of a moved vault). */
+  private sources(from: string): HistorySource[] {
+    return [{ remote: this.o.remote, from }, ...(this.o.archives ?? [])];
   }
 
   /** True if the file's current content is stored in the remote history (replacing it loses nothing). */

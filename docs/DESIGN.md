@@ -1,6 +1,6 @@
 # Encrypted GitHub Sync – Design
 
-Status: Manifest-formatVersion 2 (große Dateien als Chunks, §2.5); Config-formatVersion 1. Dieses Dokument deckt die Punkte 1–7 aus Abschnitt 65 des
+Status: Manifest-formatVersion 2 (große Dateien als Chunks, §2.5), 3 nur für umgezogene Vaults (§7c); Config-formatVersion 1. Dieses Dokument deckt die Punkte 1–7 aus Abschnitt 65 des
 Anforderungsprofils ab. Leitprinzip: **Ein Synchronisationsfehler darf unbequem sein. Ein Datenverlust
 oder Klartext-Leak darf nicht passieren.**
 
@@ -329,6 +329,7 @@ werden nie als lokale Löschung interpretiert; ihre Remote-Einträge bleiben unv
 | 22 | Wiederherstellen einer Version / „Kopie behalten“ bei Konflikt überschreibt ungesicherten Inhalt | Ersetzen nur, wenn der aktuelle Inhalt dem Remote-Manifest entspricht (also in der Historie liegt); sonst erst Sync, sonst Abbruch (`UnsyncedChanges`). Unter Mutex; Hash-Prüfung des verglichenen Inhalts direkt vor dem Schreiben. Verworfene Konfliktkopie → Papierkorb. |
 | 23 | Gelöschte Datei wiederherstellen überschreibt eine neue Datei gleichen Namens | Nie: belegter Name → `Name (restored).ext`. Inhalt gegen `contentHash` des Manifests vor der Löschung geprüft. |
 | 24 | Chunk fehlt/vertauscht/manipuliert | Chunk-Hash aus dem authentisierten Index + GCM je Chunk + Gesamt-Hash; erst nach vollständiger Prüfung im Speicher wird geschrieben. Fuzz-Tests laufen zusätzlich mit 3-Byte-Chunks. |
+| 25 | Umzug: Gerät pusht weiter ins alte Repo / Änderungen gehen beim Wechsel verloren | Authentisierter Marker per CAS blockiert jedes weitere Schreiben ins alte Repo; Wechsel behält die Merge-Basis, lokale Änderungen werden ins neue Repo hochgeladen. Kopie voll verifiziert, fortsetzbar; das alte Repo bleibt vollständig erhalten. Fuzz-Suite mit Umzug. |
 
 ### Bekannte, akzeptierte Metadaten-Leaks
 
@@ -388,6 +389,55 @@ Ablauf (`src/sync/VersionHistory.ts`):
   `contentHash`/Größe prüfen; Ergebnis pro Pfad „fehlt“/„beschädigt“, dazu nicht referenzierte Objekte.
   Ca. eine Anfrage pro Datei; Abbruch und Rate-Limit liefern einen Teilbericht.
 
+
+## 7c. Umzug in ein neues Repository (Historie verdichten)
+
+Die Git-Historie wächst nur (kein Force-Push, jede Version bleibt). Kürzen ohne Löschen geht nur, indem der Vault
+in einem **neuen** Repository mit dem aktuellen Stand weiterläuft.
+
+| Option | Bewertung |
+|---|---|
+| Neues Repository, altes bleibt Archiv (**umgesetzt**) | Nichts wird gelöscht; alte Versionen bleiben lesbar; Größe sinkt tatsächlich. Token braucht Zugriff auf beide Repos. |
+| Neuer verwaister Branch im selben Repo | Repo-Größe sinkt nicht, solange der alte Branch existiert. |
+| Alten Branch löschen / Force-Push | Datenverlust der Historie, widerspricht „nie automatisch löschen“. |
+
+Ablauf (`src/sync/VaultMigration.ts`, unter Mutex direkt nach einem erfolgreichen Sync):
+
+1. Quelle: verifizierter Head (Config-MAC, Manifest, Parent-Bindung) muss `lastRemoteCommit` sein.
+2. Ziel: leer → Bootstrap mit **derselben** öffentlichen Config (gleiche vaultId, Key-Slots, MAC; Passwort und
+   Recovery-Key gelten weiter). Enthält es bereits diesen Vault (abgebrochener Umzug) → Fortsetzung.
+3. Spiegeln in Batches (500 Dateien / 64 MiB): jede Datei aus der Quelle laden, voll verifizieren, mit neuer Nonce
+   unter **derselben Object-ID** neu verschlüsseln (Chunks neu), committen (fast-forward). Jedes Zwischen-Manifest
+   ist Teilmenge des End-Manifests (keine Pfadkollisionen); Tombstones werden übernommen. Das End-Manifest enthält
+   `movedFrom: [{owner, repo, branch, commit}]` (Archiv bis zum letzten Inhalts-Commit). Versionen starten bei
+   Quell-Version + 2, bleiben also monoton.
+4. Marker in der Quelle: ein Manifest mit `movedTo: {owner, repo, branch}` (formatVersion 3) per CAS. Hat
+   zwischenzeitlich ein anderes Gerät gepusht, schlägt das fehl → nach einem Sync erneut starten (setzt fort).
+5. Eigenes Gerät: `lastRemoteCommit`, `remote`, `lastManifestVersion` auf das Ziel umgestellt; die Merge-Basis bleibt
+   (gleiche IDs, gleiche Inhalte). Einstellungen zeigen danach auf das neue Repo.
+
+Andere Geräte: `SyncEngine.loadRemote` erkennt den (authentisierten) Marker → `Blocked("VaultMoved")`, nichts
+wird geschrieben. „Switch to new repository“ (`followMove`) prüft das Ziel voll (MAC, Manifest-Bindung, Ziel nennt
+das bisherige Repo in `movedFrom`, Version > zuletzt gesehen) und setzt nur die Remote-Zeiger um – die Basis bleibt,
+lokale ungesicherte Änderungen werden danach ins neue Repo hochgeladen. Ohne Zugriff des Tokens auf das neue Repo
+schlägt der Wechsel ohne Änderung fehl.
+
+Format 3 wird nur für Manifeste mit `movedTo`/`movedFrom` geschrieben; Vaults, die nie umgezogen sind, bleiben
+Format 2. Versionsverlauf und gelöschte Dateien lesen nach dem aktuellen Repo die Archive aus `movedFrom`
+(Migrations-Commits werden dabei übersprungen, sie wiederholen nur die letzte Archiv-Version). Nicht mehr
+erreichbare Archive verkürzen nur die Liste. Die Repo-Größe (GitHub-Angabe, verzögert aktualisiert) steht in den
+Einstellungen; ab 1 GiB weist ein Hinweis auf den Umzug hin.
+
+Nicht erledigt: Orphans alter Chunks im Ziel nach einem Abbruch mitten in einer Datei-Ersetzung (harmlos, „Repository
+prüfen“ zählt sie).
+
+## 7d. Sync-Status im Dateibaum
+
+`SyncEngine.localStatus()` (ohne Netz, derselbe Scan wie der Zähler „pending“) liefert je Datei `synced`, `pending`
+oder `skipped`; `FileStatus.explorerMarks` ergänzt Konflikte (Original und Kopie) und `ignored` (vom Filter
+ausgeschlossen) und fasst Ordner zusammen (Konflikt > ausstehend > übersprungen). Obsidian hat dafür keine
+öffentliche API: `ExplorerStatus` setzt defensiv ein `data-`-Attribut an den Elementen der Dateiansicht; ändert
+Obsidian seine Interna, fehlen nur die Markierungen.
 ## 8. Grenzen von Version 1
 
 * Leere Ordner werden nicht synchronisiert.
@@ -417,12 +467,13 @@ src/github     HttpClient, GitHubAuth (PAT), GitHubClient (Retry/Backoff/Rate-Li
                GitHubRemoteRepository
 src/sync       SyncEngine, ChangeDetector, SyncPlanner (3-Wege-Merge), ConflictNaming, SyncMutex, ChunkedContent,
                VersionHistory, DeletedFiles, ConflictResolver, RepositoryVerifier, HistoryReader, LocalContent,
+               VaultMigration, FileStatus,
                SyncController (Trigger), VaultSetup (Init/Connect/Passwort/Recovery)
 src/vault      LocalFileSystem, VaultScanner, VaultWriter (Journal-Ops), IgnoreMatcher, SyncFilter, PathUtils
 src/state      LocalState, StateRepository (2-Generationen + Prüfsumme), SyncStateStore, SecretStore, ActivityLog
 src/platform   Obsidian-Adapter (FileSystem, requestUrl, SecretStorage, Plugin-Ordner, localStorage)
 src/ui         SettingsTab, SetupWizard, StatusBar, ConflictView, Modals, VersionHistoryModal, DeletedFilesModal,
-               VerifyModal, ActivityModal, DiffView
+               VerifyModal, ActivityModal, DiffView, MoveVaultModal, ExplorerStatus
 src/util       bytes, canonicalJson, validate, Logger, diff (Myers)
 src/errors     VaultSyncError, CryptoError, GitHubError, SyncError
 ```
@@ -442,7 +493,8 @@ Nur `src/platform`, `src/ui` und `src/main.ts` importieren `obsidian`.
 * Randomisierte Zwei-Geräte-Sitzungen (mit/ohne Crashes, Neustarts, Netzabbrüche) prüfen die Invariante
   „lokaler Inhalt bleibt im Vault, im Papierkorb oder in der Remote-Historie“ sowie Konvergenz. Diese Tests
   haben zwei Fehler bei case-insensitiven Dateisystemen gefunden (behoben, siehe `ChangeDetector`). Beide
-  Fuzz-Suiten laufen zusätzlich mit 3-Byte-Chunks, sodass fast jede Datei als Chunk-Index übertragen wird.
+  Fuzz-Suiten laufen zusätzlich mit 3-Byte-Chunks, sodass fast jede Datei als Chunk-Index übertragen wird. Eine
+  weitere Suite zieht den Vault mitten in der Sitzung um (Batches à 2 Dateien); das andere Gerät folgt.
 
 ## 11. Offen / Phase 7
 

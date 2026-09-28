@@ -4,7 +4,9 @@ import { decodeChunkIndex } from "../src/sync/ChunkedContent";
 import type { SyncLimits } from "../src/sync/SyncEngine";
 import { concatBytes } from "../src/util/bytes";
 import { crypto, twoDevices, type Device } from "./fakes/harness";
-import { CrashError, type FakeRemoteRepository } from "./fakes/FakeRemoteRepository";
+import { CrashError, FakeRemoteRepository } from "./fakes/FakeRemoteRepository";
+import { SyncError } from "../src/errors/SyncError";
+import { followMove, moveVault } from "../src/sync/VaultMigration";
 import { GitHubError } from "../src/errors/GitHubError";
 
 /** Every plaintext ever committed (recoverable from the git history), chunked files reassembled. */
@@ -187,3 +189,51 @@ describe(`randomised sessions with crashes, restarts and offline periods${varian
 function fuzzSeeds(): string | undefined {
   return (globalThis as { process?: { env: Record<string, string | undefined> } }).process?.env.FUZZ_SEEDS;
 }
+
+describe("randomised sessions with a vault move in the middle", () => {
+  const SEEDS = Number(fuzzSeeds() ?? 40);
+  const OLD = { owner: "alice", repo: "vault", branch: "main" };
+  const NEW = { owner: "alice", repo: "vault-2", branch: "main" };
+  for (let seed = 1; seed <= SEEDS; seed++) {
+    it(`seed ${seed}`, async () => {
+      const rnd = prng(seed * 104729);
+      const { a, b, remote } = await twoDevices(seed % 2 === 0 ? { chunkSize: 3 } : {});
+      const target = new FakeRemoteRepository();
+      const counter = { n: 0 };
+      const moveRound = 1 + Math.floor(rnd() * 4);
+      const history = async (d: Device): Promise<Set<string>> => new Set([...(await remoteHistory(remote, d)), ...(await remoteHistory(target, d))]);
+      const step = async (d: Device): Promise<void> => {
+        const before = new Set(Object.values(d.fs.snapshot()));
+        try {
+          await d.sync();
+        } catch (error: unknown) {
+          if (!(error instanceof SyncError) || error.blockReason !== "VaultMoved") throw error;
+          await followMove({ crypto, keys: d.keys, store: d.store, deviceId: d.deviceId, sourceLocation: OLD, target });
+          d.switchRemote(target);
+          await d.sync();
+        }
+        const after = contents(d);
+        const known = await history(d);
+        for (const c of before) expect(after.has(c) || known.has(c), `lost local content "${c}"`).toBe(true);
+      };
+      for (let round = 0; round < 6; round++) {
+        randomOps(a, rnd, "A", counter);
+        randomOps(b, rnd, "B", counter);
+        if (round === moveRound && a.remote === remote) {
+          await step(a);
+          await moveVault({ crypto, keys: a.keys, store: a.store, deviceId: a.deviceId, source: remote, sourceLocation: OLD, target, targetLocation: NEW, limits: { maxFilesPerCommit: 2 } });
+          a.switchRemote(target);
+        }
+        for (const d of rnd() < 0.5 ? [a, b] : [b, a]) await step(d);
+      }
+      for (let i = 0; i < 3; i++) {
+        await step(a);
+        await step(b);
+      }
+      expect(b.remote).toBe(target);
+      expect(a.fs.snapshot()).toEqual(b.fs.snapshot());
+      expect(await a.engine.countPendingChanges()).toBe(0);
+      expect(await b.engine.countPendingChanges()).toBe(0);
+    });
+  }
+});

@@ -1,5 +1,5 @@
-import type { Manifest, ManifestEntry } from "../manifest/Manifest";
-import { parseManifestEntries, parseManifestObject } from "../manifest/ManifestCodec";
+import type { Manifest, ManifestEntry, RepoLocation } from "../manifest/Manifest";
+import { parseManifestEntries, parseManifestObject, parseRepoLocation } from "../manifest/ManifestCodec";
 import {
   expectArray,
   expectInteger,
@@ -106,6 +106,11 @@ export interface PendingCommit {
   readonly manifest: Manifest;
 }
 
+export interface MovedTo extends RepoLocation {
+  /** Commit of the old repository that carries the marker. */
+  readonly markerCommit: string;
+}
+
 export interface LocalState {
   readonly stateVersion: 1;
   readonly deviceId: string;
@@ -123,6 +128,8 @@ export interface LocalState {
   journal: ApplyJournal | null;
   pendingCommit: PendingCommit | null;
   conflicts: ConflictRecord[];
+  /** Set when the remote announced that the vault moved (see SyncError "VaultMoved"). */
+  movedTo: MovedTo | null;
 }
 
 export function newLocalState(deviceId: string): LocalState {
@@ -140,6 +147,7 @@ export function newLocalState(deviceId: string): LocalState {
     journal: null,
     pendingCommit: null,
     conflicts: [],
+    movedTo: null,
   };
 }
 
@@ -195,6 +203,7 @@ export function parseLocalState(raw: unknown): LocalState {
     journal,
     pendingCommit,
     conflicts: expectArray(r.conflicts, "state.conflicts").map((c) => parseConflict(c)),
+    movedTo: isRecord(r.movedTo) ? { ...parseRepoLocation({ owner: r.movedTo.owner, repo: r.movedTo.repo, branch: r.movedTo.branch }, "state.movedTo"), markerCommit: expectString(r.movedTo.markerCommit, "state.movedTo.markerCommit", GIT_SHA) } : null,
   };
 }
 

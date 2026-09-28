@@ -3,7 +3,7 @@ import { EncryptionEngine } from "../crypto/EncryptionEngine";
 import type { VaultKeys } from "../crypto/KeyManager";
 import { CryptoError } from "../errors/CryptoError";
 import { SyncError } from "../errors/SyncError";
-import { emptyManifest, entriesEquivalent, isLive, MANIFEST_FORMAT_VERSION, MANIFEST_TYPE, type LiveEntry, type Manifest, type ManifestEntry } from "../manifest/Manifest";
+import { emptyManifest, entriesEquivalent, formatVersionFor, isLive, MANIFEST_TYPE, type LiveEntry, type Manifest, type ManifestEntry } from "../manifest/Manifest";
 import { decodeManifest, encodeManifest } from "../manifest/ManifestCodec";
 import { parseVaultConfig, type PublicVaultConfig } from "../manifest/VaultConfig";
 import { buildCommitMessage } from "../remote/RemoteLayout";
@@ -19,7 +19,7 @@ import { scanVault } from "../vault/VaultScanner";
 import { applyLocalOps } from "../vault/VaultWriter";
 import { buildLocalView, type LocalView } from "./ChangeDetector";
 import { planPull, planPush, type PlanContext } from "./SyncPlanner";
-import { DEFAULT_CHUNK_SIZE, encodeObject, readChunkIndex, readObjectContent, type ChunkRef } from "./ChunkedContent";
+import { DEFAULT_CHUNK_SIZE, encodeObject, readChunkIndex, readObjectContent, withChunks, type ChunkRef } from "./ChunkedContent";
 
 export interface SyncLimits {
   /** Files larger than this are not synchronised (GitHub hard limit is 100 MB per file). */
@@ -56,6 +56,8 @@ const STALE_READ_DELAYS_MS = [2_000, 5_000, 10_000, 20_000];
 export const HARD_MAX_FILE_SIZE = 256 * 1024 * 1024;
 
 export type SyncMode = "full" | "pull";
+
+export type FileSyncState = "synced" | "pending" | "skipped";
 
 export type FileChangeAction =
   | "downloaded"
@@ -191,17 +193,31 @@ export class SyncEngine {
 
   /** Number of local changes that would be uploaded by the next sync (for the status bar). */
   async countPendingChanges(): Promise<number> {
+    return (await this.localStatus()).pending;
+  }
+
+  /**
+   * Per-file state of the local vault without network access: `synced` (matches the merge base), `pending`
+   * (new, changed or moved – the next sync uploads it) or `skipped` (not synchronised: too large, unreadable,
+   * invalid name). Files the sync filter excludes are absent from the map.
+   */
+  async localStatus(): Promise<{ pending: number; files: Map<string, FileSyncState> }> {
+    const files = new Map<string, FileSyncState>();
     const state = this.state;
-    if (!state.vaultId) return 0;
+    if (!state.vaultId) return { pending: 0, files };
     const filter = await this.buildFilter();
     const scan = await scanVault(this.o.fs, filter, state.hashCache, this.o.crypto, this.limits);
     const view = await buildLocalView(scan, { ...state.localMap }, state.base, filter, this.o.fs);
-    let count = view.deleted.size + view.untracked.size;
+    let pending = view.deleted.size + view.untracked.size;
+    for (const file of view.untracked.values()) files.set(file.path, "pending");
     for (const [id, file] of view.present) {
       const b = state.base[id];
-      if (!isLive(b) || b.path !== file.path || b.contentHash !== file.hash) count++;
+      const changed = !isLive(b) || b.path !== file.path || b.contentHash !== file.hash;
+      if (changed) pending++;
+      files.set(file.path, changed ? "pending" : "synced");
     }
-    return count;
+    for (const path of scan.skipped.keys()) files.set(path, "skipped");
+    return { pending, files };
   }
 
   // ───────────────────────── steps ─────────────────────────
@@ -281,6 +297,14 @@ export class SyncEngine {
       if (parents.length !== 1 || parents[0] !== manifest.parentCommit) throw SyncError.blocked("HistoryRewritten");
     }
 
+    if (manifest.movedTo) {
+      // Authenticated (GCM + parent binding above) terminal marker: never write to a retired repository; the
+      // user switches explicitly. Checked before the rollback checks: after an interrupted move this device's
+      // state may already point at the new repository, and the marker must still be recognised.
+      state.movedTo = { ...manifest.movedTo, markerCommit: head };
+      await this.o.store.persist();
+      throw SyncError.blocked("VaultMoved");
+    }
     if (state.lastRemoteCommit !== null) {
       if (manifest.version < state.lastManifestVersion) throw SyncError.blocked("HistoryRewritten");
       if (!(await this.o.remote.isAncestor(state.lastRemoteCommit, head))) throw SyncError.blocked("HistoryRewritten");
@@ -451,13 +475,14 @@ export class SyncEngine {
 
     const manifest: Manifest = {
       type: MANIFEST_TYPE,
-      formatVersion: MANIFEST_FORMAT_VERSION,
+      formatVersion: formatVersionFor(remote),
       vaultId: state.vaultId as string,
       version: remote.version + 1,
       parentCommit: head,
       device: this.o.deviceId,
       updatedAt: this.now(),
       entries,
+      ...(remote.movedFrom ? { movedFrom: remote.movedFrom } : {}),
     };
     const encoded = encodeManifest(manifest);
     // Self-check: never publish a manifest our own strict parser would reject.
@@ -527,9 +552,4 @@ function revertEntry(entries: Record<string, ManifestEntry>, remote: Manifest, o
   const previous = remote.entries[objectId];
   if (previous) entries[objectId] = previous;
   else delete entries[objectId];
-}
-
-function withChunks(entry: LiveEntry, chunks: number | undefined): LiveEntry {
-  const { chunks: _previous, ...rest } = entry;
-  return chunks === undefined ? rest : { ...rest, chunks };
 }

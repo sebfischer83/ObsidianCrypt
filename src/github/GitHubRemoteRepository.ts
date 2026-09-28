@@ -1,7 +1,7 @@
 import { GitHubError } from "../errors/GitHubError";
 import { SyncError } from "../errors/SyncError";
 import { serializeVaultConfig, type PublicVaultConfig } from "../manifest/VaultConfig";
-import { armor, assertEncrypted, CONFIG_PATH, MANIFEST_PATH, objectIdFromPath, objectPath, parseCommitDevice, unarmor } from "../remote/RemoteLayout";
+import { armor, assertEncrypted, CONFIG_PATH, isMigrationMessage, MANIFEST_PATH, objectIdFromPath, objectPath, parseCommitDevice, unarmor } from "../remote/RemoteLayout";
 import type { CommitMetadata, HeadState, ObjectRevision, RemoteChange, RemoteRepository } from "../remote/RemoteRepository";
 import { toBase64, utf8Decode } from "../util/bytes";
 import { GIT_SHA, ValidationError } from "../util/validate";
@@ -64,7 +64,7 @@ export class GitHubRemoteRepository implements RemoteRepository {
 
   async listObjectRevisions(from: string, objectId: string, limit: number): Promise<ObjectRevision[]> {
     const commits = await this.api.listCommitsForPath(from, objectPath(objectId), limit);
-    return commits.slice(0, limit).map((c) => ({ commit: c.sha, date: c.date, device: parseCommitDevice(c.message) }));
+    return commits.slice(0, limit).map((c) => ({ commit: c.sha, date: c.date, device: parseCommitDevice(c.message), migration: isMigrationMessage(c.message) }));
   }
 
   async listObjectIds(commit: string): Promise<{ ids: string[]; complete: boolean }> {

@@ -74,7 +74,7 @@ Requires Obsidian 1.11.4 or newer. Do not use a second sync tool for the same va
 * Syncs on startup, ~30 s after the last change, on app resume and optionally every 1–60 minutes.
 * Commands: *Sync now*, *Pull from GitHub*, *Push to GitHub* (always pulls and merges first), *Show status*,
   *Show conflicts*, *Lock vault*, *Unlock vault*, *Change password*, *Show version history of current note*,
-  *Restore deleted files*, *Show sync activity*, *Verify repository*.
+  *Restore deleted files*, *Show sync activity*, *Verify repository*, *Move vault to a new repository*.
 * Status bar: `☁ Synced`, `☁ 4 pending`, `↻ Syncing`, `☁ Offline · 37 pending`, `⚠ 2 conflicts`, `⚠ Sync error`.
 * **Conflicts** never lose data: if a note was changed on two devices, the remote version keeps the name and
   your version is saved as `Note (conflict 2026-09-26 1a2b3c4d).md`. Delete-vs-modify always keeps the
@@ -95,6 +95,14 @@ Requires Obsidian 1.11.4 or newer. Do not use a second sync tool for the same va
   manifest (read-only; about one GitHub request per file).
 * **Large files** (over 4 MB) are uploaded as encrypted 4 MB chunks; after a change only the changed chunks are
   uploaded again. Maximum file size is configurable up to 256 MB (default 50 MB).
+* **Sync status in the file explorer**: ● not synchronised yet, ⚠ conflict, ⊘ too large or unreadable, ◌ excluded
+  (folders show the most important mark of their contents). Can be turned off in the settings.
+* **Repository size and moving to a new repository**: the settings show the repository size (a hint appears
+  above 1 GB). *Move to a new repository* copies the current state of all files – verified and re-encrypted –
+  into a new empty private repository (it can be created for you) and continues there. The old repository is
+  kept untouched as an archive (version history and deleted files still reach into it). Other devices stop
+  syncing with the old repository and offer *Switch to new repository*; their unsynchronised changes are kept.
+  The access token needs access to the new repository on every device.
 * `.vaultsyncignore` (gitignore-like) excludes files before encryption. `.obsidian` sync is configurable
   (core settings on by default; plugins, themes/snippets and workspace separately).
 * If the repository was manipulated (force-push, deleted branch, corrupted manifest, foreign vault, newer
@@ -104,7 +112,8 @@ Requires Obsidian 1.11.4 or newer. Do not use a second sync tool for the same va
 
 This version writes manifest format 2 on its first upload. Devices still running 0.1.x then stop syncing with
 “The repository uses a newer format version. Please update the plugin.” – update the plugin on all devices.
-No data is touched while a device is stopped.
+No data is touched while a device is stopped. Moving a vault to a new repository (0.3.0) writes manifest
+format 3; devices must run 0.3.0 or later to follow the move.
 
 ## Limits
 
@@ -139,8 +148,10 @@ Test suites:
   in the history), restore as copy, deleted versions, planted foreign objects, GitHub API requests.
 * `chunks.test.ts` – chunked round trips, delta uploads, chunk cleanup on change/rename/delete, history of chunked
   files, swapped or corrupted chunks, malformed chunk indexes, chunk uploads over the GitHub API.
+* `migration.test.ts` – moving a vault (copy, marker, following devices with unsynced changes, archive history,
+  resume after crash, concurrent push, unsafe targets, GitHub API incl. repository creation).
 * `features.test.ts` – deleted-file restore, repository verification (corrupted/missing/orphaned objects),
-  activity reporting and log, conflict resolution safety, line diff.
+  activity reporting and log, conflict resolution safety, line diff, file explorer marks.
 * `fuzz.test.ts` – randomised two-device sessions (optionally with crashes, restarts and network drops;
-  each also with 3-byte chunks)
+  each also with 3-byte chunks; one suite moves the vault mid-session)
   checking that local content is never lost and that devices converge (`FUZZ_SEEDS=400 npm test`).

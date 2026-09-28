@@ -22,7 +22,11 @@ import { SyncEngine, type FileChange, type SyncMode, type SyncReport } from "./s
 import { ConflictResolver } from "./sync/ConflictResolver";
 import { DeletedFiles, type ResolvedDeletedFile } from "./sync/DeletedFiles";
 import { RepositoryVerifier, type VerifyReport } from "./sync/RepositoryVerifier";
-import { VersionHistory, type FileVersion, type RestoreOutcome } from "./sync/VersionHistory";
+import { VersionHistory, type FileVersion, type HistorySource, type RestoreOutcome } from "./sync/VersionHistory";
+import { followMove, moveVault } from "./sync/VaultMigration";
+import { DEFAULT_CHUNK_SIZE } from "./sync/ChunkedContent";
+import type { RepoLocation } from "./manifest/Manifest";
+import { SyncError } from "./errors/SyncError";
 import {
   changeVaultPassword,
   connectExistingVault,
@@ -42,16 +46,20 @@ import { DEFAULT_IGNORE_RULES, IGNORE_FILE, SyncFilter, type FilterSettings } fr
 import { ConflictView } from "./ui/ConflictView";
 import { SettingsTab } from "./ui/SettingsTab";
 import { SetupWizard } from "./ui/SetupWizard";
-import { openChangePasswordModal, promptVaultSecret, showRecoveryKey } from "./ui/Modals";
+import { formatBytes, openChangePasswordModal, promptVaultSecret, showRecoveryKey } from "./ui/Modals";
 import { StatusModal } from "./ui/StatusModal";
 import { StatusBar, statusText } from "./ui/StatusBar";
 import { VersionHistoryModal } from "./ui/VersionHistoryModal";
 import { ActivityModal } from "./ui/ActivityModal";
 import { DeletedFilesModal } from "./ui/DeletedFilesModal";
 import { VerifyModal } from "./ui/VerifyModal";
+import { MoveVaultModal } from "./ui/MoveVaultModal";
+import { ExplorerStatus } from "./ui/ExplorerStatus";
 
 const DEVICE_ID_KEY = "encrypted-github-sync-device-id";
 const MIB = 1024 * 1024;
+/** Suggest moving to a fresh repository above this size (GitHub recommends staying well below 5 GB). */
+const SIZE_WARNING_BYTES = 1024 * MIB;
 
 export default class EncryptedSyncPlugin extends Plugin {
   override settings: PluginSettings = { ...DEFAULT_SETTINGS };
@@ -68,6 +76,9 @@ export default class EncryptedSyncPlugin extends Plugin {
   private readonly statusListeners = new Set<(status: SyncStatus) => void>();
   private lastEngine: SyncEngine | null = null;
   activity!: ActivityLog;
+  private sizeCache: { at: number; bytes: number | null } | null = null;
+  private sizeWarned = false;
+  explorerStatus!: ExplorerStatus;
   private persistHandle: number | null = null;
 
   override async onload(): Promise<void> {
@@ -85,11 +96,17 @@ export default class EncryptedSyncPlugin extends Plugin {
     this.fs = new ObsidianFileSystem(this.app, () => (this.settings.syncConfigDir ? [this.app.vault.configDir] : []));
 
     this.statusBar = new StatusBar(this.addStatusBarItem(), () => this.openStatus());
+    this.explorerStatus = new ExplorerStatus(this.app, () => this.store.state.conflicts);
+    this.explorerStatus.enabled = this.settings.showExplorerStatus;
     // Obsidian mobile has no status bar: the ribbon icon shows the state and opens the status dialog.
     this.ribbonEl = this.addRibbonIcon("cloud", "Encrypted sync", () => this.openStatus());
     this.controller = new SyncController({
       runSync: (mode) => this.runEngine(mode),
-      countPending: () => this.buildEngine().countPendingChanges(),
+      countPending: async () => {
+        const status = await this.buildEngine().localStatus();
+        this.explorerStatus.update(status.files);
+        return status.pending;
+      },
       countConflicts: () => this.store.state.conflicts.length,
       isConfigured: () => this.isConfigured(),
       isUnlocked: () => this.keyManager.isUnlocked,
@@ -125,6 +142,7 @@ export default class EncryptedSyncPlugin extends Plugin {
 
   override onunload(): void {
     this.controller?.stop();
+    this.explorerStatus?.destroy();
     if (this.persistHandle !== null) window.clearTimeout(this.persistHandle);
     if (this.store?.isDirty) void this.store.persist();
     // Only the in-memory copy is dropped; a remembered key stays in the OS keychain.
@@ -343,7 +361,7 @@ export default class EncryptedSyncPlugin extends Plugin {
   // ───────────────────────── version history ─────────────────────────
 
   versionHistory(): VersionHistory {
-    return new VersionHistory({ crypto: this.crypto, fs: this.fs, remote: this.buildRemote(), store: this.store, getKeys: () => this.keyManager.keys });
+    return new VersionHistory({ crypto: this.crypto, fs: this.fs, remote: this.buildRemote(), store: this.store, getKeys: () => this.keyManager.keys, archives: this.archiveSources() });
   }
 
   async openVersionHistory(file: TFile): Promise<void> {
@@ -377,7 +395,7 @@ export default class EncryptedSyncPlugin extends Plugin {
   // ───────────────────────── deleted files / verification / activity ─────────────────────────
 
   deletedFiles(): DeletedFiles {
-    return new DeletedFiles({ crypto: this.crypto, fs: this.fs, remote: this.buildRemote(), store: this.store, getKeys: () => this.keyManager.keys });
+    return new DeletedFiles({ crypto: this.crypto, fs: this.fs, remote: this.buildRemote(), store: this.store, getKeys: () => this.keyManager.keys, archives: this.archiveSources() });
   }
 
   async restoreDeletedFile(deleted: DeletedFiles, file: ResolvedDeletedFile): Promise<string> {
@@ -433,6 +451,100 @@ export default class EncryptedSyncPlugin extends Plugin {
 
   private logError(error: unknown): void {
     this.activity.add("error", `Sync failed: ${describeError(error, this.tokenList())}`).catch((e: unknown) => logUnexpected(this.settings.debugLogging, "activity log", e));
+  }
+
+  // ───────────────────────── repository size / moving the vault ─────────────────────────
+
+  currentLocation(): RepoLocation {
+    return { owner: this.settings.owner, repo: this.settings.repo, branch: this.settings.branch };
+  }
+
+  /** Earlier repositories of a moved vault (read-only history sources). */
+  private archiveSources(): HistorySource[] {
+    return (this.store.state.remote?.movedFrom ?? []).map((a) => ({ remote: this.buildRemote(a.owner, a.repo, a.branch), from: a.commit }));
+  }
+
+  /** Repository size as reported by GitHub (cached for 10 minutes; GitHub itself updates it lazily). */
+  async repositorySize(force = false): Promise<number | null> {
+    const now = Date.now();
+    if (!force && this.sizeCache && now - this.sizeCache.at < 10 * 60_000) return this.sizeCache.bytes;
+    const bytes = (await this.buildApi().getRepository()).sizeBytes;
+    this.sizeCache = { at: now, bytes };
+    return bytes;
+  }
+
+  private async warnAboutSize(): Promise<void> {
+    if (this.sizeWarned || !this.isConfigured()) return;
+    const bytes = await this.repositorySize().catch(() => null);
+    if (bytes === null || bytes < SIZE_WARNING_BYTES) return;
+    this.sizeWarned = true;
+    new Notice(`The repository is ${formatBytes(bytes)} large. Every version stays in its history; you can continue in a fresh repository (settings → Move to a new repository).`, 15000);
+  }
+
+  /** What a target repository for a move currently is. */
+  async inspectMoveTarget(target: RepoLocation): Promise<"missing" | "empty" | "resumable" | "foreign" | "otherVault"> {
+    const api = this.buildApi(target.owner, target.repo);
+    if (!(await api.getRepository()).exists) return "missing";
+    const inspection = await inspectRemote(this.buildRemote(target.owner, target.repo, target.branch));
+    if (inspection.kind === "uninitialized") return "empty";
+    if (inspection.kind === "foreign") return "foreign";
+    return inspection.config.vaultId === this.store.state.vaultId ? "resumable" : "otherVault";
+  }
+
+  async createMoveTarget(target: RepoLocation): Promise<void> {
+    await this.buildApi(target.owner, target.repo).createPrivateRepository();
+  }
+
+  /** Syncs, copies the vault into `target`, retires the current repository and switches this device over. */
+  async moveToRepository(target: RepoLocation, onProgress: (done: number, total: number) => void): Promise<number> {
+    const report = await this.controller.runNow("full");
+    if (!report) throw new SyncError("InvalidState", "synchronisation is not possible right now (locked, blocked or already running)");
+    const source = this.currentLocation();
+    const result = await this.controller.runExclusive(() =>
+      moveVault({
+        crypto: this.crypto,
+        keys: this.keyManager.keys,
+        store: this.store,
+        deviceId: this.deviceId,
+        source: this.buildRemote(),
+        sourceLocation: source,
+        target: this.buildRemote(target.owner, target.repo, target.branch),
+        targetLocation: target,
+        limits: { chunkSize: DEFAULT_CHUNK_SIZE },
+        onProgress,
+      }),
+    );
+    await this.switchLocation(target);
+    await this.logAction(`Vault moved from ${source.owner}/${source.repo} to ${target.owner}/${target.repo} (${result.copied} files copied)`, []);
+    void this.controller.requestSync("full");
+    return result.copied;
+  }
+
+  /** After another device moved the vault: continue in the repository its marker names. */
+  async followVaultMove(): Promise<void> {
+    const moved = this.store.state.movedTo;
+    if (!moved) return;
+    const source = this.currentLocation();
+    await this.controller.runExclusive(() =>
+      followMove({ crypto: this.crypto, keys: this.keyManager.keys, store: this.store, deviceId: this.deviceId, sourceLocation: source, target: this.buildRemote(moved.owner, moved.repo, moved.branch) }),
+    );
+    await this.switchLocation(moved);
+    await this.logAction(`Switched to the new repository ${moved.owner}/${moved.repo}`, []);
+    this.controller.clearBlock();
+    void this.controller.requestSync("full");
+  }
+
+  private async switchLocation(target: RepoLocation): Promise<void> {
+    this.settings.owner = target.owner;
+    this.settings.repo = target.repo;
+    this.settings.branch = target.branch;
+    this.sizeCache = null;
+    this.sizeWarned = false;
+    await this.saveSettings();
+  }
+
+  openMoveVault(): void {
+    void this.openUnlocked(() => new MoveVaultModal(this).open());
   }
 
   // ───────────────────────── conflicts ─────────────────────────
@@ -501,6 +613,7 @@ export default class EncryptedSyncPlugin extends Plugin {
 
   private reportResult(report: SyncReport, manual: boolean): void {
     this.logSync(report);
+    if (report.uploaded > 0) void this.warnAboutSize();
     const conflicts = report.newConflicts.length;
     if (conflicts > 0) new Notice(`${conflicts} synchronization conflict${conflicts === 1 ? "" : "s"} detected.`, 10000);
     if (report.nameCollisions.length > 0) new Notice(`${report.nameCollisions.length} file(s) not uploaded: another file with the same name (different case) exists.`, 10000);
@@ -526,6 +639,7 @@ export default class EncryptedSyncPlugin extends Plugin {
     this.addCommand({ id: "restore-deleted", name: "Restore deleted files", callback: () => this.openDeletedFiles() });
     this.addCommand({ id: "verify-repository", name: "Verify repository", callback: () => this.openVerify() });
     this.addCommand({ id: "show-activity", name: "Show sync activity", callback: () => this.openActivity() });
+    this.addCommand({ id: "move-repository", name: "Move vault to a new repository", callback: () => this.openMoveVault() });
     this.addCommand({
       id: "show-version-history",
       name: "Show version history of current note",
@@ -594,7 +708,11 @@ export default class EncryptedSyncPlugin extends Plugin {
   }
 
   private registerVaultEvents(): void {
-    const changed = (): void => this.controller.notifyChange();
+    const changed = (): void => {
+      this.controller.notifyChange();
+      this.explorerStatus.schedule();
+    };
+    this.registerEvent(this.app.workspace.on("layout-change", () => this.explorerStatus.schedule()));
     this.registerEvent(this.app.vault.on("create", changed));
     this.registerEvent(this.app.vault.on("modify", changed));
     this.registerEvent(this.app.vault.on("delete", changed));

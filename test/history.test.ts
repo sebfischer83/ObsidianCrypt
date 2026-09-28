@@ -168,8 +168,8 @@ describe("version history", () => {
     await a.sync();
     const revisions = await a.remote.listObjectRevisions(a.store.state.lastRemoteCommit!, objectId, 20);
     expect(revisions).toHaveLength(2);
-    expect(await history.load({ ...revisions[0]!, objectId })).toBeNull();
-    expect(utf8Decode((await history.load({ ...revisions[1]!, objectId }))!)).toBe("v1");
+    expect(await history.load({ ...revisions[0]!, objectId, source: 0 })).toBeNull();
+    expect(utf8Decode((await history.load({ ...revisions[1]!, objectId, source: 0 }))!)).toBe("v1");
   });
 
   it("rejects a foreign object planted at the file's remote path", async () => {

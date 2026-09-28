@@ -26,6 +26,8 @@ export interface PluginSettings extends TriggerSettings {
   maxFileSizeMB: number;
   /** How many earlier versions the version history lists per file. */
   versionHistoryLimit: number;
+  /** Marks unsynchronised, conflicting, skipped and excluded files in the file explorer. */
+  showExplorerStatus: boolean;
   /** Keep the vault master key in the OS keychain so syncing works without re-entering the password. */
   rememberKey: boolean;
   kdfForNewVaults: PasswordKdfAlgorithm;
@@ -51,6 +53,7 @@ export const DEFAULT_SETTINGS: PluginSettings = {
   syncWorkspace: false,
   maxFileSizeMB: DEFAULT_LIMITS.maxFileSize / (1024 * 1024),
   versionHistoryLimit: 20,
+  showExplorerStatus: true,
   rememberKey: true,
   kdfForNewVaults: "argon2id",
   debugLogging: false,

@@ -7,7 +7,7 @@ import type EncryptedSyncPlugin from "../main";
 import { MAX_FILE_SIZE_MB_LIMIT } from "../settings";
 import { MAX_VERSION_LIMIT } from "../sync/VersionHistory";
 import { IGNORE_FILE } from "../vault/SyncFilter";
-import { confirmDialog } from "./Modals";
+import { confirmDialog, formatBytes } from "./Modals";
 import { SetupWizard } from "./SetupWizard";
 import { statusText } from "./StatusBar";
 
@@ -98,6 +98,20 @@ export class SettingsTab extends PluginSettingTab {
         }
       }),
     );
+    const sizeSetting = new Setting(containerEl)
+      .setName("Repository size")
+      .setDesc(this.plugin.isConfigured() ? "Loading…" : "Not configured")
+      .addButton((b) => b.setButtonText("Move to a new repository").setDisabled(!this.plugin.isConfigured()).onClick(() => this.plugin.openMoveVault()));
+    if (this.plugin.isConfigured()) {
+      void this.plugin
+        .repositorySize()
+        .then((bytes) =>
+          sizeSetting.setDesc(
+            `${bytes === null ? "unknown" : formatBytes(bytes)} (as reported by GitHub). Every version stays in the history; moving to a new repository starts over with only the current files and keeps this one as an archive.`,
+          ),
+        )
+        .catch((error: unknown) => sizeSetting.setDesc(`Size unavailable: ${describeError(error)}`));
+    }
 
     // ── Encryption ──
     new Setting(containerEl).setName("Encryption").setHeading();
@@ -200,6 +214,17 @@ export class SettingsTab extends PluginSettingTab {
           new Notice("Ignore rules saved.");
         });
       });
+    new Setting(containerEl)
+      .setName("Show sync status in the file explorer")
+      .setDesc("● not synchronised yet · ⚠ conflict · ⊘ too large or unreadable · ◌ excluded. Folders show the most important mark of their contents.")
+      .addToggle((t) =>
+        t.setValue(s.showExplorerStatus).onChange(async (v) => {
+          s.showExplorerStatus = v;
+          this.plugin.explorerStatus.enabled = v;
+          this.plugin.explorerStatus.render();
+          await save();
+        }),
+      );
     new Setting(containerEl)
       .setName("Maximum file size (MB)")
       .setDesc(`Larger files are skipped (hard limit ${MAX_FILE_SIZE_MB_LIMIT} MB). Files over 4 MB are uploaded as encrypted chunks; only changed chunks are uploaded again.`)

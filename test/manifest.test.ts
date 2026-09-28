@@ -77,7 +77,7 @@ describe("manifest", () => {
   it("rejects unknown fields, foreign vaults and newer formats", () => {
     expectBlocked(() => decodeManifest(utf8Encode(JSON.stringify({ ...sample(), extra: 1 })), VAULT), "ManifestCorrupted");
     expectBlocked(() => decodeManifest(encodeManifest(sample()), "f".repeat(32)), "ForeignVault");
-    expectBlocked(() => decodeManifest(utf8Encode(JSON.stringify({ ...sample(), formatVersion: 3 })), VAULT), "UnknownFormatVersion");
+    expectBlocked(() => decodeManifest(utf8Encode(JSON.stringify({ ...sample(), formatVersion: 4 })), VAULT), "UnknownFormatVersion");
     expectBlocked(() => decodeManifest(utf8Encode("not json"), VAULT), "ManifestCorrupted");
   });
 
@@ -98,5 +98,24 @@ describe("manifest format 2 (chunked objects)", () => {
     expect(withChunks.entries[id]).toEqual({ ...live, chunks: 3 });
     expectBlocked(() => decodeManifest(utf8Encode(JSON.stringify({ ...m, entries: { [id]: { ...live, chunks: 0 } } })), VAULT), "ManifestCorrupted");
     expectBlocked(() => decodeManifest(utf8Encode(JSON.stringify({ ...m, entries: { [id]: { ...live, chunks: 1.5 } } })), VAULT), "ManifestCorrupted");
+  });
+});
+
+describe("manifest format 3 (moved vaults)", () => {
+  it("accepts move fields only with format 3 and validates repository names", () => {
+    const m = { ...sample(), formatVersion: 3 };
+    const movedTo = { owner: "alice", repo: "vault-2", branch: "main" };
+    const movedFrom = [{ owner: "alice", repo: "vault", branch: "main", commit: "a".repeat(40) }];
+    expect(decodeManifest(utf8Encode(JSON.stringify({ ...m, movedTo, movedFrom })), VAULT)).toMatchObject({ movedTo, movedFrom });
+    expectBlocked(() => decodeManifest(utf8Encode(JSON.stringify({ ...m, formatVersion: 2, movedTo })), VAULT), "ManifestCorrupted");
+    for (const bad of [
+      { ...movedTo, owner: "-x" },
+      { ...movedTo, repo: ".." },
+      { ...movedTo, repo: "a/b" },
+      { ...movedTo, branch: "a..b" },
+      { ...movedTo, extra: 1 },
+    ]) {
+      expectBlocked(() => decodeManifest(utf8Encode(JSON.stringify({ ...m, movedTo: bad })), VAULT), "ManifestCorrupted");
+    }
   });
 });

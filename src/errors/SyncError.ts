@@ -26,7 +26,8 @@ export type BlockReason =
   | "ConfigCorrupted"
   | "UnknownFormatVersion"
   | "ForeignVault"
-  | "RepositoryNotEmpty";
+  | "RepositoryNotEmpty"
+  | "VaultMoved";
 
 const BLOCK_MESSAGES: Record<BlockReason, string> = {
   BranchDeleted: "The remote branch was deleted. Synchronisation stopped to protect local data.",
@@ -38,6 +39,7 @@ const BLOCK_MESSAGES: Record<BlockReason, string> = {
   UnknownFormatVersion: "The repository uses a newer format version. Please update the plugin.",
   ForeignVault: "The repository belongs to a different encrypted vault. Synchronisation stopped.",
   RepositoryNotEmpty: "The repository contains files that are not an encrypted vault. Use an empty repository.",
+  VaultMoved: "This vault moved to another repository. Open the status dialog to switch to it.",
 };
 
 const MESSAGES: Record<Exclude<SyncErrorCode, "Blocked">, string> = {

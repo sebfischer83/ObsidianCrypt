@@ -5,6 +5,7 @@ import { ActivityLog } from "../src/state/ActivityLog";
 import type { BlobFileStore } from "../src/state/StateRepository";
 import { ConflictResolver } from "../src/sync/ConflictResolver";
 import { DeletedFiles } from "../src/sync/DeletedFiles";
+import { explorerMarks } from "../src/sync/FileStatus";
 import { RepositoryVerifier } from "../src/sync/RepositoryVerifier";
 import { decodeText, diffLines, splitLines, type DiffLine } from "../src/util/diff";
 import { utf8Decode, utf8Encode } from "../src/util/bytes";
@@ -275,5 +276,51 @@ describe("line diff", () => {
     expect(decodeText(utf8Encode("Grüße"))).toBe("Grüße");
     expect(decodeText(new Uint8Array([0x66, 0, 0x67]))).toBeNull();
     expect(decodeText(new Uint8Array([0xff, 0xfe, 0x41]))).toBeNull();
+  });
+});
+
+describe("file status for the explorer", () => {
+  it("reports synced, pending and skipped files and marks folders", async () => {
+    const { a } = await twoDevices({ maxFileSize: 10 });
+    a.fs.setText("Dir/synced.md", "ok");
+    a.fs.setText("Dir/Sub/changed.md", "one");
+    await a.sync();
+    a.fs.setText("Dir/Sub/changed.md", "two");
+    a.fs.setText("new.md", "new");
+    a.fs.setText("big.md", "this file is too large");
+    a.fs.setText(".trash/old.md", "ignored");
+
+    const status = await a.engine.localStatus();
+    expect(Object.fromEntries(status.files)).toEqual({
+      "Dir/synced.md": "synced",
+      "Dir/Sub/changed.md": "pending",
+      "new.md": "pending",
+      "big.md": "skipped",
+    });
+    expect(status.pending).toBe(await a.engine.countPendingChanges());
+    expect(status.pending).toBe(2);
+
+    const items = [
+      { path: "Dir", isFolder: true },
+      { path: "Dir/Sub", isFolder: true },
+      { path: "Dir/synced.md", isFolder: false },
+      { path: "Dir/Sub/changed.md", isFolder: false },
+      { path: "big.md", isFolder: false },
+      { path: "Clean", isFolder: true },
+      { path: "unknown.md", isFolder: false },
+      { path: "Note.md", isFolder: false },
+      { path: "Note (conflict 2026-09-28 abc).md", isFolder: false },
+    ];
+    const conflicts = [{ id: "c", kind: "content" as const, path: "Dir/synced.md", conflictPath: "Note (conflict 2026-09-28 abc).md", detectedAt: 0, objectId: null }];
+    const marks = explorerMarks(items, new Map([...status.files, ["Note.md", "synced" as const]]), conflicts);
+    expect(Object.fromEntries(marks)).toEqual({
+      Dir: "conflict",
+      "Dir/Sub": "pending",
+      "Dir/synced.md": "conflict",
+      "Dir/Sub/changed.md": "pending",
+      "big.md": "skipped",
+      "unknown.md": "ignored",
+      "Note (conflict 2026-09-28 abc).md": "conflict",
+    });
   });
 });

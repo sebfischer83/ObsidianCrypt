@@ -34,7 +34,7 @@ export class Device {
   now = 1_790_000_000_000;
 
   constructor(
-    readonly remote: RemoteRepository,
+    public remote: RemoteRepository,
     readonly deviceId: string = `${(++deviceCounter).toString(16).padStart(8, "0")}-0000-4000-8000-000000000000`,
     private limits: Partial<SyncLimits> = {},
     fs?: MemoryFileSystem,
@@ -60,6 +60,12 @@ export class Device {
       now: () => this.now,
       sleep: async () => undefined,
     });
+  }
+
+  /** Points this device at another repository (settings change after a vault move). */
+  switchRemote(remote: RemoteRepository): void {
+    this.remote = remote;
+    this.buildEngine();
   }
 
   /** Changes this device's limits (e.g. the max file size setting). */

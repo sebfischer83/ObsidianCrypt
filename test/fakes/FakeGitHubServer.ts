@@ -34,6 +34,7 @@ export class FakeGitHubServer implements HttpClient {
   staleRefReads = 0;
   private stale = new Map<string, { sha: string; remaining: number }>();
   canPush = true;
+  canCreateRepos = true;
 
   constructor(
     readonly owner = "alice",
@@ -85,6 +86,15 @@ export class FakeGitHubServer implements HttpClient {
   private handle(req: HttpRequest): HttpResponse {
     if (req.headers.Authorization !== `Bearer ${this.token}`) return this.json(401, { message: "Bad credentials" });
     const url = new URL(req.url);
+    if (req.method === "GET" && url.pathname === "/user") return this.json(200, { login: this.owner });
+    if (req.method === "POST" && (url.pathname === "/user/repos" || url.pathname === `/orgs/${this.owner}/repos`)) {
+      const body = JSON.parse(req.body ?? "{}") as Record<string, unknown>;
+      if (!this.canCreateRepos) return this.json(403, { message: "Resource not accessible by personal access token" });
+      if (body.name !== this.repo || this.repoExists) return this.json(422, { message: "name already exists" });
+      if (body.private !== true) throw new Error("plugin must only create private repositories");
+      this.repoExists = true;
+      return this.json(201, { name: this.repo, private: true });
+    }
     const prefix = `/repos/${this.owner}/${this.repo}`;
     if (!url.pathname.startsWith(prefix) || !this.repoExists) return this.json(404, { message: "Not Found" });
     const path = decodeURIComponent(url.pathname.slice(prefix.length));
@@ -93,7 +103,7 @@ export class FakeGitHubServer implements HttpClient {
     if (req.method !== "GET" && !this.canPush) return this.json(403, { message: "Resource not accessible by personal access token" });
 
     if (req.method === "GET" && path === "") {
-      return this.json(200, { private: true, default_branch: "main", permissions: { push: this.canPush, admin: false } });
+      return this.json(200, { private: true, default_branch: "main", size: Math.ceil([...this.blobs.values()].reduce((s, b) => s + b.length, 0) / 1024), permissions: { push: this.canPush, admin: false } });
     }
     if (req.method === "GET" && path === "/branches") return this.json(200, [...this.refs.keys()].map((name) => ({ name })));
 

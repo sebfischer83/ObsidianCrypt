@@ -68,3 +68,18 @@ export function objectIdFromPath(path: string): string | null {
   const m = OBJECT_PATH.exec(path);
   return m && m[2]!.startsWith(m[1]!) ? m[2]! : null;
 }
+
+const MIGRATION_PREFIX = "Encrypted vault migration: ";
+
+/** Commits that copy the vault into a new repository (their versions duplicate the archive's). */
+export function buildMigrationMessage(changeCount: number, deviceId: string): string {
+  return `${MIGRATION_PREFIX}${changeCount} ${changeCount === 1 ? "change" : "changes"}\n\nDevice: ${deviceId}\n`;
+}
+
+export function isMigrationMessage(message: string): boolean {
+  return message.startsWith(MIGRATION_PREFIX);
+}
+
+export function buildMovedMessage(deviceId: string): string {
+  return `Encrypted vault moved\n\nDevice: ${deviceId}\n`;
+}

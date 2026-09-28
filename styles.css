@@ -82,3 +82,27 @@
 .encrypted-sync-progress {
   width: 100%;
 }
+.nav-file-title[data-encrypted-sync]::after,
+.nav-folder-title[data-encrypted-sync]::after {
+  margin-left: auto;
+  padding-left: var(--size-4-1);
+  font-size: 0.75em;
+  line-height: 1;
+  flex-shrink: 0;
+}
+[data-encrypted-sync="pending"]::after {
+  content: "●";
+  color: var(--color-orange);
+}
+[data-encrypted-sync="conflict"]::after {
+  content: "⚠";
+  color: var(--text-error);
+}
+[data-encrypted-sync="skipped"]::after {
+  content: "⊘";
+  color: var(--text-muted);
+}
+[data-encrypted-sync="ignored"]::after {
+  content: "◌";
+  color: var(--text-faint);
+}

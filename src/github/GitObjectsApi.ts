@@ -30,16 +30,32 @@ export class GitObjectsApi {
     this.repoPath = `/repos/${encodeURIComponent(owner)}/${encodeURIComponent(repo)}`;
   }
 
-  async getRepository(): Promise<{ exists: boolean; canPush: boolean; isPrivate: boolean; defaultBranch: string | null }> {
+  async getRepository(): Promise<{ exists: boolean; canPush: boolean; isPrivate: boolean; defaultBranch: string | null; sizeBytes: number | null }> {
     const { status, data } = await this.client.json<unknown>("GET", this.repoPath, { allow: [404] });
-    if (status === 404 || !isRecord(data)) return { exists: false, canPush: false, isPrivate: false, defaultBranch: null };
+    if (status === 404 || !isRecord(data)) return { exists: false, canPush: false, isPrivate: false, defaultBranch: null, sizeBytes: null };
     const permissions = isRecord(data.permissions) ? data.permissions : {};
     return {
       exists: true,
       canPush: permissions.push === true || permissions.admin === true || permissions.maintain === true,
       isPrivate: data.private === true,
       defaultBranch: typeof data.default_branch === "string" ? data.default_branch : null,
+      // GitHub reports KiB, recomputed lazily (may lag behind recent pushes).
+      sizeBytes: typeof data.size === "number" && Number.isFinite(data.size) && data.size >= 0 ? data.size * 1024 : null,
     };
+  }
+
+  /**
+   * Creates this (missing) repository as a private, empty repository – under the token's user or, if the
+   * owner is an organisation, in that organisation. Needs repository administration permission.
+   */
+  async createPrivateRepository(): Promise<void> {
+    const { data: user } = await this.client.json<unknown>("GET", "/user");
+    const login = expectString(expectRecord(user, "user").login, "user.login");
+    const path = login.toLowerCase() === this.owner.toLowerCase() ? "/user/repos" : `/orgs/${encodeURIComponent(this.owner)}/repos`;
+    await this.client.json<unknown>("POST", path, {
+      body: { name: this.repo, private: true, auto_init: false, description: "Encrypted Obsidian vault" },
+      retryable: false,
+    });
   }
 
   async hasAnyBranch(): Promise<boolean> {
