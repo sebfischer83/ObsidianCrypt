@@ -28,3 +28,57 @@
   border-radius: var(--radius-s);
   background-color: var(--background-secondary);
 }
+.encrypted-sync-diff {
+  max-height: 45vh;
+  overflow: auto;
+  font-family: var(--font-monospace);
+  font-size: var(--font-ui-small);
+  padding: var(--size-4-2);
+  border-radius: var(--radius-s);
+  background-color: var(--background-secondary);
+}
+.encrypted-sync-diff > div {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.encrypted-sync-diff-added {
+  color: var(--text-success);
+  background-color: rgba(var(--color-green-rgb), 0.1);
+}
+.encrypted-sync-diff-removed {
+  color: var(--text-error);
+  background-color: rgba(var(--color-red-rgb), 0.1);
+}
+.encrypted-sync-diff-skip {
+  color: var(--text-faint);
+}
+.encrypted-sync-diff-legend {
+  display: flex;
+  gap: var(--size-4-4);
+  margin-bottom: var(--size-4-2);
+  font-size: var(--font-ui-small);
+}
+.encrypted-sync-activity details {
+  padding: var(--size-4-1) 0;
+  border-bottom: 1px solid var(--background-modifier-border);
+}
+.encrypted-sync-activity summary {
+  cursor: pointer;
+}
+.encrypted-sync-activity-time {
+  color: var(--text-muted);
+  font-size: var(--font-ui-small);
+}
+.encrypted-sync-activity-error summary {
+  color: var(--text-error);
+}
+.encrypted-sync-activity ul {
+  margin: var(--size-4-1) 0;
+  font-size: var(--font-ui-small);
+}
+.encrypted-sync-activity-action {
+  color: var(--text-muted);
+}
+.encrypted-sync-progress {
+  width: 100%;
+}

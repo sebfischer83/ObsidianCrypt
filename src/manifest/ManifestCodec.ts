@@ -14,10 +14,11 @@ import {
   ValidationError,
 } from "../util/validate";
 import { isValidVaultPath, pathKey } from "../vault/PathUtils";
-import { MANIFEST_TYPE, type Manifest, type ManifestEntry } from "./Manifest";
-import { SUPPORTED_FORMAT_VERSION } from "./VaultConfig";
+import { MANIFEST_FORMAT_VERSION, MANIFEST_TYPE, type Manifest, type ManifestEntry } from "./Manifest";
 
 export const MAX_MANIFEST_ENTRIES = 1_000_000;
+/** Upper bound for the chunk count of one file (far above HARD_MAX_FILE_SIZE / chunk size). */
+export const MAX_CHUNKS = 100_000;
 const DEVICE_ID = /^[0-9a-f-]{8,64}$/;
 
 /** Deterministic serialisation (canonical JSON). */
@@ -48,7 +49,7 @@ export function parseManifestObject(raw: unknown, expectedVaultId: string): Mani
   const record = expectRecord(raw, "manifest");
   expectLiteral(record.type, MANIFEST_TYPE, "manifest.type");
   const formatVersion = expectInteger(record.formatVersion, "manifest.formatVersion", 1);
-  if (formatVersion > SUPPORTED_FORMAT_VERSION) throw SyncError.blocked("UnknownFormatVersion");
+  if (formatVersion > MANIFEST_FORMAT_VERSION) throw SyncError.blocked("UnknownFormatVersion");
   expectOnlyKeys(record, ["type", "formatVersion", "vaultId", "version", "parentCommit", "device", "updatedAt", "entries"], "manifest");
   const vaultId = expectString(record.vaultId, "manifest.vaultId", HEX_32);
   if (vaultId !== expectedVaultId) throw SyncError.blocked("ForeignVault");
@@ -104,10 +105,10 @@ function parseEntry(value: unknown, field: string): ManifestEntry {
       deletedBy: expectString(value.deletedBy, `${field}.deletedBy`, DEVICE_ID),
     };
   }
-  expectOnlyKeys(value, ["path", "size", "contentHash", "modified", "updatedAtVersion", "updatedBy"], field);
+  expectOnlyKeys(value, ["path", "size", "contentHash", "modified", "updatedAtVersion", "updatedBy", "chunks"], field);
   const path = expectString(value.path, `${field}.path`);
   if (!isValidVaultPath(path)) throw new ValidationError(`${field}.path`, "invalid path");
-  return {
+  const entry = {
     path,
     size: expectInteger(value.size, `${field}.size`, 0),
     contentHash: expectString(value.contentHash, `${field}.contentHash`, HEX_64),
@@ -115,4 +116,5 @@ function parseEntry(value: unknown, field: string): ManifestEntry {
     updatedAtVersion: expectInteger(value.updatedAtVersion, `${field}.updatedAtVersion`, 0),
     updatedBy: expectString(value.updatedBy, `${field}.updatedBy`, DEVICE_ID),
   };
+  return value.chunks === undefined ? entry : { ...entry, chunks: expectInteger(value.chunks, `${field}.chunks`, 1, MAX_CHUNKS) };
 }

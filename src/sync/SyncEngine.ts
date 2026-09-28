@@ -3,7 +3,7 @@ import { EncryptionEngine } from "../crypto/EncryptionEngine";
 import type { VaultKeys } from "../crypto/KeyManager";
 import { CryptoError } from "../errors/CryptoError";
 import { SyncError } from "../errors/SyncError";
-import { emptyManifest, entriesEquivalent, isLive, MANIFEST_TYPE, type Manifest, type ManifestEntry } from "../manifest/Manifest";
+import { emptyManifest, entriesEquivalent, isLive, MANIFEST_FORMAT_VERSION, MANIFEST_TYPE, type LiveEntry, type Manifest, type ManifestEntry } from "../manifest/Manifest";
 import { decodeManifest, encodeManifest } from "../manifest/ManifestCodec";
 import { parseVaultConfig, type PublicVaultConfig } from "../manifest/VaultConfig";
 import { buildCommitMessage } from "../remote/RemoteLayout";
@@ -19,6 +19,7 @@ import { scanVault } from "../vault/VaultScanner";
 import { applyLocalOps } from "../vault/VaultWriter";
 import { buildLocalView, type LocalView } from "./ChangeDetector";
 import { planPull, planPush, type PlanContext } from "./SyncPlanner";
+import { DEFAULT_CHUNK_SIZE, encodeObject, readChunkIndex, readObjectContent, type ChunkRef } from "./ChunkedContent";
 
 export interface SyncLimits {
   /** Files larger than this are not synchronised (GitHub hard limit is 100 MB per file). */
@@ -31,6 +32,8 @@ export interface SyncLimits {
   readonly maxCommitsPerRun: number;
   /** How often a push is retried after another device pushed concurrently. */
   readonly maxConcurrentRetries: number;
+  /** Files larger than this are split into encrypted chunks of this size (manifest formatVersion 2). */
+  readonly chunkSize: number;
 }
 
 export const DEFAULT_LIMITS: SyncLimits = {
@@ -39,15 +42,40 @@ export const DEFAULT_LIMITS: SyncLimits = {
   maxBytesPerCommit: 64 * 1024 * 1024,
   maxCommitsPerRun: 20,
   maxConcurrentRetries: 3,
+  chunkSize: DEFAULT_CHUNK_SIZE,
 };
 
-/** Base64 request bodies must stay below GitHub's 100 MB limit (72 MiB × 4/3 ≈ 96 MiB). */
+
 /** Re-read delays when the remote head appears to be behind our last known commit (eventual consistency). */
 const STALE_READ_DELAYS_MS = [2_000, 5_000, 10_000, 20_000];
 
-export const HARD_MAX_FILE_SIZE = 72 * 1024 * 1024;
+/**
+ * Large files are chunked, so GitHub request limits no longer bound the size. The file is still read and
+ * assembled in memory once (Obsidian has no ranged I/O) and every version stays in the git history forever.
+ */
+export const HARD_MAX_FILE_SIZE = 256 * 1024 * 1024;
 
 export type SyncMode = "full" | "pull";
+
+export type FileChangeAction =
+  | "downloaded"
+  | "uploaded"
+  | "movedLocally"
+  | "movedRemotely"
+  | "deletedLocally"
+  | "deletedRemotely"
+  | "conflict"
+  /** Written by the user through version history, deleted files or conflict resolution. */
+  | "restored"
+  /** Moved to the vault trash by conflict resolution. */
+  | "trashed";
+
+export interface FileChange {
+  readonly action: FileChangeAction;
+  readonly path: string;
+  /** Previous path of a move, or the copy created for a conflict. */
+  readonly other?: string;
+}
 
 export interface SyncReport {
   downloaded: number;
@@ -63,6 +91,8 @@ export interface SyncReport {
   morePending: boolean;
   recoveredJournal: boolean;
   recoveredCommit: boolean;
+  /** Files changed by this run, locally and remotely (for the activity log). */
+  changes: FileChange[];
 }
 
 export interface SyncEngineOptions {
@@ -120,6 +150,7 @@ export class SyncEngine {
       morePending: false,
       recoveredJournal: false,
       recoveredCommit: false,
+      changes: [],
     };
     const state = this.state;
     if (!state.vaultId) throw new SyncError("NotConfigured");
@@ -315,18 +346,22 @@ export class SyncEngine {
       localMap: state.localMap,
       hashCache: state.hashCache,
       recovery,
-      fetchContent: async (objectId, contentHash) => {
-        const envelope = await this.o.remote.readObject(journal.remoteCommit, objectId);
-        return engine.decryptObject(objectId, envelope, contentHash);
-      },
+      fetchContent: (objectId, contentHash) => readObjectContent(this.o.remote, engine, journal.remoteCommit, objectId, contentHash, HARD_MAX_FILE_SIZE),
     });
 
     for (let i = 0; i < journal.ops.length; i++) {
       const op = journal.ops[i];
       if (!op || result.failures.some((f) => f.index === i)) continue;
-      if (op.op === "write") report.downloaded++;
-      else if (op.op === "move") report.localMoves++;
-      else if (op.op === "trash") report.localDeletes++;
+      if (op.op === "write") {
+        report.downloaded++;
+        report.changes.push({ action: "downloaded", path: op.path });
+      } else if (op.op === "move") {
+        report.localMoves++;
+        report.changes.push({ action: "movedLocally", path: op.to, other: op.from });
+      } else if (op.op === "trash") {
+        report.localDeletes++;
+        report.changes.push({ action: "deletedLocally", path: op.path });
+      }
     }
     report.failedLocalOps += result.failures.length;
     for (const failure of result.failures) {
@@ -344,6 +379,7 @@ export class SyncEngine {
       if (state.conflicts.some((c) => c.id === conflict.id)) continue;
       state.conflicts.push(conflict);
       report.newConflicts.push(conflict);
+      report.changes.push({ action: "conflict", path: conflict.path, ...(conflict.conflictPath ? { other: conflict.conflictPath } : {}) });
     }
     state.remote = journal.remoteManifest;
     state.lastRemoteCommit = journal.remoteCommit;
@@ -372,7 +408,8 @@ export class SyncEngine {
 
     const entries = plan.entries;
     const changes: RemoteChange[] = [];
-    let uploaded = 0;
+    const chunking = { remote: this.o.remote, engine, chunkSize: this.limits.chunkSize, newChunkId: () => toHex(this.o.crypto.randomBytes(16)) };
+    const pushed: FileChange[] = [];
     for (const upload of plan.uploads) {
       let data: Uint8Array;
       try {
@@ -388,18 +425,33 @@ export class SyncEngine {
         continue;
       }
       const hash = await this.o.crypto.hash(data);
+      const encoded = await encodeObject(chunking, upload.objectId, data, await this.remoteChunks(head, remote, upload.objectId, engine));
       const entry = entries[upload.objectId];
-      if (isLive(entry) && (hash !== upload.expectedHash || data.length !== entry.size)) {
-        entries[upload.objectId] = { ...entry, contentHash: hash, size: data.length, modified: this.now() };
+      if (isLive(entry)) {
+        const updated: LiveEntry =
+          hash !== upload.expectedHash || data.length !== entry.size ? { ...entry, contentHash: hash, size: data.length, modified: this.now() } : entry;
+        entries[upload.objectId] = withChunks(updated, encoded.chunks);
       }
-      changes.push({ kind: "putObject", objectId: upload.objectId, blob: await engine.encryptObject(upload.objectId, data) });
-      uploaded++;
+      changes.push(...encoded.changes);
+      pushed.push({ action: "uploaded", path: upload.path });
     }
-    for (const id of plan.deletes) changes.push({ kind: "deleteObject", objectId: id });
+    for (const id of plan.deletes) {
+      changes.push({ kind: "deleteObject", objectId: id });
+      const previous = state.base[id];
+      if (isLive(previous)) pushed.push({ action: "deletedRemotely", path: previous.path });
+      for (const chunk of (await this.remoteChunks(head, remote, id, engine)) ?? []) changes.push({ kind: "deleteObject", objectId: chunk.id });
+    }
+    const uploadedIds = new Set(plan.uploads.map((u) => u.objectId));
+    for (const [id, entry] of Object.entries(entries)) {
+      const before = remote.entries[id];
+      if (!uploadedIds.has(id) && isLive(entry) && isLive(before) && entry.path !== before.path) {
+        pushed.push({ action: "movedRemotely", path: entry.path, other: before.path });
+      }
+    }
 
     const manifest: Manifest = {
       type: MANIFEST_TYPE,
-      formatVersion: 1,
+      formatVersion: MANIFEST_FORMAT_VERSION,
       vaultId: state.vaultId as string,
       version: remote.version + 1,
       parentCommit: head,
@@ -433,10 +485,20 @@ export class SyncEngine {
     this.finalizeCommit(commit, manifest);
     await this.o.store.persist();
     report.commits.push(commit);
-    report.uploaded += uploaded;
+    report.uploaded += pushed.filter((c) => c.action === "uploaded").length;
+    report.changes.push(...pushed);
     report.remoteDeletes += plan.deletes.length;
-    this.log.info("pushed commit", { uploads: uploaded, deletes: plan.deletes.length });
+    this.log.info("pushed commit", { changes: pushed.length, deletes: plan.deletes.length });
     return plan.morePending ? "more" : "done";
+  }
+
+  /** Chunks of the object's version at `head` (to reuse unchanged ones and remove obsolete ones), or null. */
+  private async remoteChunks(head: string, remote: Manifest, objectId: string, engine: EncryptionEngine): Promise<ChunkRef[] | null> {
+    const entry = remote.entries[objectId];
+    if (!isLive(entry) || entry.chunks === undefined) return null;
+    const chunks = await readChunkIndex(this.o.remote, engine, head, objectId);
+    if (chunks.length !== entry.chunks) throw new CryptoError("IntegrityMismatch", "chunk count differs from the manifest");
+    return chunks;
   }
 
   /**
@@ -465,4 +527,9 @@ function revertEntry(entries: Record<string, ManifestEntry>, remote: Manifest, o
   const previous = remote.entries[objectId];
   if (previous) entries[objectId] = previous;
   else delete entries[objectId];
+}
+
+function withChunks(entry: LiveEntry, chunks: number | undefined): LiveEntry {
+  const { chunks: _previous, ...rest } = entry;
+  return chunks === undefined ? rest : { ...rest, chunks };
 }

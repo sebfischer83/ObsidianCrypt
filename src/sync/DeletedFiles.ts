@@ -1,0 +1,104 @@
+import type { CryptoProvider } from "../crypto/CryptoProvider";
+import { EncryptionEngine } from "../crypto/EncryptionEngine";
+import type { VaultKeys } from "../crypto/KeyManager";
+import { SyncError } from "../errors/SyncError";
+import { isLive, isTombstone, type Manifest } from "../manifest/Manifest";
+import type { RemoteRepository } from "../remote/RemoteRepository";
+import type { SyncStateStore } from "../state/SyncStateStore";
+import type { LocalFileSystem } from "../vault/LocalFileSystem";
+import { readObjectContent } from "./ChunkedContent";
+import { restoredPath } from "./ConflictNaming";
+import { readManifestAt } from "./HistoryReader";
+import { HARD_MAX_FILE_SIZE } from "./SyncEngine";
+
+export interface DeletedFile {
+  readonly objectId: string;
+  readonly deletedAtVersion: number;
+  readonly deletedBy: string;
+}
+
+export interface ResolvedDeletedFile extends DeletedFile {
+  readonly path: string;
+  readonly size: number;
+  readonly contentHash: string;
+  /** Commit right before the deletion (contains the last version). */
+  readonly contentCommit: string;
+  /** Time of the deleting commit (commit metadata: informational only). */
+  readonly deletedAt: number;
+}
+
+export interface DeletedFilesOptions {
+  readonly crypto: CryptoProvider;
+  readonly fs: LocalFileSystem;
+  readonly remote: RemoteRepository;
+  readonly store: SyncStateStore;
+  readonly getKeys: () => VaultKeys;
+}
+
+/**
+ * Files deleted on any device, recovered from the encrypted history. Tombstones carry neither path nor
+ * hash (docs/DESIGN.md §3); both come from the manifest of the commit right before the deletion, whose
+ * content hash then verifies the recovered content completely. Restoring creates a new file (new object
+ * id); nothing existing is ever overwritten.
+ */
+export class DeletedFiles {
+  private readonly manifests = new Map<string, Promise<Manifest>>();
+
+  constructor(private readonly o: DeletedFilesOptions) {}
+
+  /** Deleted files of the last synchronised manifest, most recently deleted first. No network access. */
+  list(): DeletedFile[] {
+    const entries = this.o.store.state.remote?.entries ?? {};
+    const out: DeletedFile[] = [];
+    for (const [objectId, entry] of Object.entries(entries)) {
+      if (isTombstone(entry)) out.push({ objectId, deletedAtVersion: entry.deletedAtVersion, deletedBy: entry.deletedBy });
+    }
+    return out.sort((a, b) => b.deletedAtVersion - a.deletedAtVersion || (a.objectId < b.objectId ? -1 : 1));
+  }
+
+  /** Path, size and location of the last version, or null if it cannot be found in the history. */
+  async resolve(file: DeletedFile): Promise<ResolvedDeletedFile | null> {
+    const from = this.o.store.state.lastRemoteCommit;
+    if (!from) return null;
+    const [deletion] = await this.o.remote.listObjectRevisions(from, file.objectId, 1);
+    if (!deletion) return null;
+    const parents = await this.o.remote.getParents(deletion.commit);
+    if (parents.length !== 1) return null;
+    const contentCommit = parents[0] as string;
+    const entry = (await this.manifestAt(contentCommit)).entries[file.objectId];
+    if (!isLive(entry)) return null;
+    return { ...file, path: entry.path, size: entry.size, contentHash: entry.contentHash, contentCommit, deletedAt: deletion.date };
+  }
+
+  /** Decrypted content, verified against the manifest hash. */
+  async load(file: ResolvedDeletedFile): Promise<Uint8Array> {
+    return readObjectContent(this.o.remote, this.engine(), file.contentCommit, file.objectId, file.contentHash, HARD_MAX_FILE_SIZE);
+  }
+
+  /** Writes the content at its old path, or next to it if that path is taken. Returns the path used. */
+  async restore(file: ResolvedDeletedFile, content: Uint8Array): Promise<string> {
+    for (let n = 0; n < 1000; n++) {
+      const candidate = n === 0 ? file.path : restoredPath(file.path, n);
+      if (await this.o.fs.exists(candidate)) continue;
+      await this.o.fs.write(candidate, content);
+      return candidate;
+    }
+    throw new SyncError("InvalidState", "no free file name for the restored file");
+  }
+
+  private manifestAt(commit: string): Promise<Manifest> {
+    let pending = this.manifests.get(commit);
+    if (!pending) {
+      pending = readManifestAt(this.o.remote, this.engine(), commit);
+      pending.catch(() => this.manifests.delete(commit));
+      this.manifests.set(commit, pending);
+    }
+    return pending;
+  }
+
+  private engine(): EncryptionEngine {
+    const keys = this.o.getKeys();
+    if (keys.vaultId !== this.o.store.state.vaultId) throw SyncError.blocked("ForeignVault");
+    return new EncryptionEngine(this.o.crypto, keys);
+  }
+}

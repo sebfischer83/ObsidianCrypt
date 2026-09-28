@@ -77,7 +77,7 @@ describe("manifest", () => {
   it("rejects unknown fields, foreign vaults and newer formats", () => {
     expectBlocked(() => decodeManifest(utf8Encode(JSON.stringify({ ...sample(), extra: 1 })), VAULT), "ManifestCorrupted");
     expectBlocked(() => decodeManifest(encodeManifest(sample()), "f".repeat(32)), "ForeignVault");
-    expectBlocked(() => decodeManifest(utf8Encode(JSON.stringify({ ...sample(), formatVersion: 2 })), VAULT), "UnknownFormatVersion");
+    expectBlocked(() => decodeManifest(utf8Encode(JSON.stringify({ ...sample(), formatVersion: 3 })), VAULT), "UnknownFormatVersion");
     expectBlocked(() => decodeManifest(utf8Encode("not json"), VAULT), "ManifestCorrupted");
   });
 
@@ -85,5 +85,18 @@ describe("manifest", () => {
     const m = sample();
     const bad = { ...m, entries: { ["1".repeat(32)]: { deleted: true, deletedAtVersion: 1, deletedBy: DEVICE, path: "x.md" } } };
     expectBlocked(() => decodeManifest(utf8Encode(JSON.stringify(bad)), VAULT), "ManifestCorrupted");
+  });
+});
+
+describe("manifest format 2 (chunked objects)", () => {
+  it("still reads format 1 manifests and validates the chunk count", () => {
+    const m = sample();
+    expect(decodeManifest(utf8Encode(JSON.stringify({ ...m, formatVersion: 1 })), VAULT).formatVersion).toBe(1);
+    const id = "1".repeat(32);
+    const live = { path: "big.bin", size: 10, contentHash: "a".repeat(64), modified: 1, updatedAtVersion: 1, updatedBy: DEVICE };
+    const withChunks = decodeManifest(utf8Encode(JSON.stringify({ ...m, entries: { [id]: { ...live, chunks: 3 } } })), VAULT);
+    expect(withChunks.entries[id]).toEqual({ ...live, chunks: 3 });
+    expectBlocked(() => decodeManifest(utf8Encode(JSON.stringify({ ...m, entries: { [id]: { ...live, chunks: 0 } } })), VAULT), "ManifestCorrupted");
+    expectBlocked(() => decodeManifest(utf8Encode(JSON.stringify({ ...m, entries: { [id]: { ...live, chunks: 1.5 } } })), VAULT), "ManifestCorrupted");
   });
 });

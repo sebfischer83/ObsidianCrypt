@@ -3,6 +3,7 @@ import { describeError } from "../errors/VaultSyncError";
 import type EncryptedSyncPlugin from "../main";
 import type { FileVersion } from "../sync/VersionHistory";
 import { basename } from "../vault/PathUtils";
+import { renderDiff } from "./DiffView";
 import { confirmDialog, formatBytes } from "./Modals";
 
 /** Longest text shown in the preview (the restore itself always uses the complete version). */
@@ -17,6 +18,7 @@ export class VersionHistoryModal extends Modal {
   private readonly contents = new Map<string, Uint8Array | null>();
   private readonly rows = new Map<string, Setting>();
   private currentHash: string | null = null;
+  private current: Uint8Array | null = null;
   private previewEl: HTMLElement | null = null;
   private busy = false;
 
@@ -37,12 +39,14 @@ export class VersionHistoryModal extends Modal {
   override onClose(): void {
     this.contentEl.empty();
     this.contents.clear();
+    this.current = null;
   }
 
   private async load(): Promise<void> {
     try {
       this.versions = await this.plugin.versionHistory().list(this.path, this.plugin.settings.versionHistoryLimit);
-      this.currentHash = await this.plugin.crypto.hash(await this.plugin.fs.read(this.path));
+      this.current = await this.plugin.fs.read(this.path);
+      this.currentHash = await this.plugin.crypto.hash(this.current);
     } catch (error: unknown) {
       this.contentEl.empty();
       this.contentEl.createEl("p", { cls: "mod-warning", text: `Versions could not be loaded: ${describeError(error)}` });
@@ -111,8 +115,21 @@ export class VersionHistoryModal extends Modal {
         target.createEl("p", { text: "This version is not available: the note was deleted in this sync." });
         return;
       }
-      const text = new TextDecoder("utf-8", { fatal: false }).decode(content);
-      target.createEl("pre", { cls: "encrypted-sync-history-text", text: text.length > MAX_PREVIEW_CHARS ? `${text.slice(0, MAX_PREVIEW_CHARS)}\n…` : text });
+      const body = target.createDiv();
+      const showText = (): void => {
+        body.empty();
+        const text = new TextDecoder("utf-8", { fatal: false }).decode(content);
+        body.createEl("pre", { cls: "encrypted-sync-history-text", text: text.length > MAX_PREVIEW_CHARS ? `${text.slice(0, MAX_PREVIEW_CHARS)}\n…` : text });
+      };
+      const showDiff = (): void => {
+        if (this.current) renderDiff(body, this.current, content, "current note", "this version");
+      };
+      const toggles = new Setting(target.createDiv());
+      toggles.addButton((b) => b.setButtonText("Changes vs. current").onClick(showDiff));
+      toggles.addButton((b) => b.setButtonText("Full text").onClick(showText));
+      target.appendChild(body);
+      if (this.current) showDiff();
+      else showText();
     } catch (error: unknown) {
       target.empty();
       target.createEl("p", { cls: "mod-warning", text: describeError(error) });

@@ -15,8 +15,13 @@ import { DEFAULT_SETTINGS, loadSettings, type PluginSettings } from "./settings"
 import { SecretIds } from "./state/SecretStore";
 import { FileStateRepository } from "./state/StateRepository";
 import { SyncStateStore } from "./state/SyncStateStore";
+import { ActivityLog } from "./state/ActivityLog";
+import type { ConflictRecord } from "./state/LocalState";
 import { SyncController, type SyncStatus } from "./sync/SyncController";
-import { SyncEngine, type SyncMode, type SyncReport } from "./sync/SyncEngine";
+import { SyncEngine, type FileChange, type SyncMode, type SyncReport } from "./sync/SyncEngine";
+import { ConflictResolver } from "./sync/ConflictResolver";
+import { DeletedFiles, type ResolvedDeletedFile } from "./sync/DeletedFiles";
+import { RepositoryVerifier, type VerifyReport } from "./sync/RepositoryVerifier";
 import { VersionHistory, type FileVersion, type RestoreOutcome } from "./sync/VersionHistory";
 import {
   changeVaultPassword,
@@ -41,6 +46,9 @@ import { openChangePasswordModal, promptVaultSecret, showRecoveryKey } from "./u
 import { StatusModal } from "./ui/StatusModal";
 import { StatusBar, statusText } from "./ui/StatusBar";
 import { VersionHistoryModal } from "./ui/VersionHistoryModal";
+import { ActivityModal } from "./ui/ActivityModal";
+import { DeletedFilesModal } from "./ui/DeletedFilesModal";
+import { VerifyModal } from "./ui/VerifyModal";
 
 const DEVICE_ID_KEY = "encrypted-github-sync-device-id";
 const MIB = 1024 * 1024;
@@ -59,6 +67,7 @@ export default class EncryptedSyncPlugin extends Plugin {
   private ribbonEl: HTMLElement | null = null;
   private readonly statusListeners = new Set<(status: SyncStatus) => void>();
   private lastEngine: SyncEngine | null = null;
+  activity!: ActivityLog;
   private persistHandle: number | null = null;
 
   override async onload(): Promise<void> {
@@ -71,6 +80,8 @@ export default class EncryptedSyncPlugin extends Plugin {
       this.logger.warn("local sync state was invalid and has been ignored"),
     );
     this.store = await SyncStateStore.open(repository, this.deviceId);
+    this.activity = new ActivityLog(new PluginFolderStore(this.app, folder), `activity-${this.deviceId}.json`);
+    await this.activity.load();
     this.fs = new ObsidianFileSystem(this.app, () => (this.settings.syncConfigDir ? [this.app.vault.configDir] : []));
 
     this.statusBar = new StatusBar(this.addStatusBarItem(), () => this.openStatus());
@@ -92,7 +103,10 @@ export default class EncryptedSyncPlugin extends Plugin {
       },
       onStatus: (status) => this.publishStatus(status),
       onReport: (report) => this.reportResult(report, false),
-      onError: (error) => this.logger.warn("automatic sync failed", { crypto: error instanceof CryptoError }),
+      onError: (error) => {
+        this.logger.warn("automatic sync failed", { crypto: error instanceof CryptoError });
+        this.logError(error);
+      },
       logger: this.logger,
     });
 
@@ -348,19 +362,108 @@ export default class EncryptedSyncPlugin extends Plugin {
     // (offline, blocked, conflict), restore() refuses and the user can restore as a copy instead.
     if (!(await history.isCurrentContentSynced(path, version.objectId))) await this.controller.runNow("full");
     const outcome = await this.controller.runExclusive(() => history.restore(path, version, content));
+    if (outcome === "restored") await this.logAction(`Version from ${new Date(version.date).toLocaleString()} restored`, [{ action: "restored", path }]);
     this.controller.notifyChange();
     return outcome;
   }
 
   async restoreVersionAsCopy(path: string, version: FileVersion, content: Uint8Array): Promise<string> {
     const copy = await this.versionHistory().restoreAsCopy(path, version, content);
+    await this.logAction(`Version from ${new Date(version.date).toLocaleString()} restored as copy`, [{ action: "restored", path: copy, other: path }]);
     this.controller.notifyChange();
     return copy;
+  }
+
+  // ───────────────────────── deleted files / verification / activity ─────────────────────────
+
+  deletedFiles(): DeletedFiles {
+    return new DeletedFiles({ crypto: this.crypto, fs: this.fs, remote: this.buildRemote(), store: this.store, getKeys: () => this.keyManager.keys });
+  }
+
+  async restoreDeletedFile(deleted: DeletedFiles, file: ResolvedDeletedFile): Promise<string> {
+    const content = await deleted.load(file);
+    const path = await deleted.restore(file, content);
+    await this.logAction("Deleted file restored", [{ action: "restored", path, ...(path !== file.path ? { other: file.path } : {}) }]);
+    this.controller.notifyChange();
+    return path;
+  }
+
+  verifyRepository(onProgress: (done: number, total: number) => void, isCancelled: () => boolean): Promise<VerifyReport> {
+    return new RepositoryVerifier({ crypto: this.crypto, remote: this.buildRemote(), store: this.store, getKeys: () => this.keyManager.keys, onProgress, isCancelled }).verify();
+  }
+
+  /** Opens a dialog that needs the configured and unlocked vault. */
+  private async openUnlocked(open: () => void): Promise<void> {
+    if (!this.isConfigured()) {
+      new Notice("Encrypted sync is not set up yet.");
+      return;
+    }
+    if (!this.keyManager.isUnlocked && !(await this.promptUnlock())) return;
+    open();
+  }
+
+  openDeletedFiles(): void {
+    void this.openUnlocked(() => new DeletedFilesModal(this).open());
+  }
+
+  openVerify(): void {
+    void this.openUnlocked(() => new VerifyModal(this).open());
+  }
+
+  openActivity(): void {
+    new ActivityModal(this).open();
+  }
+
+  private async logAction(summary: string, changes: FileChange[]): Promise<void> {
+    try {
+      await this.activity.add("action", summary, changes);
+    } catch (error: unknown) {
+      logUnexpected(this.settings.debugLogging, "activity log", error);
+    }
+  }
+
+  private logSync(report: SyncReport): void {
+    const failed = report.failedLocalOps > 0 ? `, ${report.failedLocalOps} change(s) postponed` : "";
+    if (report.changes.length === 0 && !failed) return;
+    const parts = [`↓ ${report.downloaded}`, `↑ ${report.uploaded}`];
+    if (report.localDeletes + report.remoteDeletes > 0) parts.push(`🗑 ${report.localDeletes + report.remoteDeletes}`);
+    if (report.newConflicts.length > 0) parts.push(`⚠ ${report.newConflicts.length} conflict(s)`);
+    this.activity.add("sync", `${parts.join(", ")}${failed}`, report.changes).catch((error: unknown) => logUnexpected(this.settings.debugLogging, "activity log", error));
+  }
+
+  private logError(error: unknown): void {
+    this.activity.add("error", `Sync failed: ${describeError(error, this.tokenList())}`).catch((e: unknown) => logUnexpected(this.settings.debugLogging, "activity log", e));
+  }
+
+  // ───────────────────────── conflicts ─────────────────────────
+
+  private conflictResolver(): ConflictResolver {
+    return new ConflictResolver({ crypto: this.crypto, fs: this.fs, store: this.store });
   }
 
   async dismissConflict(id: string): Promise<void> {
     this.store.state.conflicts = this.store.state.conflicts.filter((c) => c.id !== id);
     await this.store.persist();
+    await this.controller.refreshStatus();
+  }
+
+  private async keepSyncedVersion(conflict: ConflictRecord, copyHash: string): Promise<void> {
+    await this.controller.runExclusive(() => this.conflictResolver().keepSynced(conflict, copyHash));
+    await this.logAction("Conflict resolved: kept the synced version", [{ action: "trashed", path: conflict.conflictPath as string }]);
+    this.controller.notifyChange();
+    await this.controller.refreshStatus();
+  }
+
+  private async keepConflictCopy(conflict: ConflictRecord, copyHash: string): Promise<void> {
+    const resolver = this.conflictResolver();
+    // Like restoring a version: the replaced content must be in the remote history first.
+    if (!(await resolver.canReplaceSynced(conflict))) await this.controller.runNow("full");
+    await this.controller.runExclusive(() => resolver.keepCopy(conflict, copyHash));
+    await this.logAction("Conflict resolved: kept the copy", [
+      { action: "restored", path: conflict.path, other: conflict.conflictPath as string },
+      { action: "trashed", path: conflict.conflictPath as string },
+    ]);
+    this.controller.notifyChange();
     await this.controller.refreshStatus();
   }
 
@@ -379,6 +482,7 @@ export default class EncryptedSyncPlugin extends Plugin {
       else new Notice("A synchronisation is already running; it will run again when finished.");
     } catch (error: unknown) {
       new Notice(`Encrypted sync: ${describeError(error, this.tokenList())}`, 10000);
+      this.logError(error);
       logUnexpected(this.settings.debugLogging, "sync command", error, this.tokenList());
     }
   }
@@ -396,6 +500,7 @@ export default class EncryptedSyncPlugin extends Plugin {
   }
 
   private reportResult(report: SyncReport, manual: boolean): void {
+    this.logSync(report);
     const conflicts = report.newConflicts.length;
     if (conflicts > 0) new Notice(`${conflicts} synchronization conflict${conflicts === 1 ? "" : "s"} detected.`, 10000);
     if (report.nameCollisions.length > 0) new Notice(`${report.nameCollisions.length} file(s) not uploaded: another file with the same name (different case) exists.`, 10000);
@@ -418,6 +523,9 @@ export default class EncryptedSyncPlugin extends Plugin {
     this.addCommand({ id: "unlock", name: "Unlock vault", callback: () => void this.promptUnlock() });
     this.addCommand({ id: "change-password", name: "Change password", callback: () => this.openChangePassword() });
     this.addCommand({ id: "setup", name: "Set up / connect repository", callback: () => new SetupWizard(this.app, this).open() });
+    this.addCommand({ id: "restore-deleted", name: "Restore deleted files", callback: () => this.openDeletedFiles() });
+    this.addCommand({ id: "verify-repository", name: "Verify repository", callback: () => this.openVerify() });
+    this.addCommand({ id: "show-activity", name: "Show sync activity", callback: () => this.openActivity() });
     this.addCommand({
       id: "show-version-history",
       name: "Show version history of current note",
@@ -450,7 +558,14 @@ export default class EncryptedSyncPlugin extends Plugin {
   }
 
   openConflicts(): void {
-    new ConflictView(this.app, { list: () => this.store.state.conflicts, dismiss: (id) => this.dismissConflict(id) }).open();
+    new ConflictView(this.app, {
+      list: () => this.store.state.conflicts,
+      dismiss: (id) => this.dismissConflict(id),
+      load: (conflict) => this.conflictResolver().load(conflict),
+      hash: (data) => this.crypto.hash(data),
+      keepSynced: (conflict, copyHash) => this.keepSyncedVersion(conflict, copyHash),
+      keepCopy: (conflict, copyHash) => this.keepConflictCopy(conflict, copyHash),
+    }).open();
   }
 
   openStatus(): void {

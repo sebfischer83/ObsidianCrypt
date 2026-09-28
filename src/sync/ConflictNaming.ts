@@ -56,3 +56,9 @@ export function versionCopyPath(path: string, date: number, n = 1): string {
   const [stem, ext] = splitExtension(basename(path));
   return joinPath(dirname(path), `${stem} (version ${stamp}${n === 1 ? "" : ` ${n}`})${ext}`);
 }
+
+/** "Folder/Note.md" → "Folder/Note (restored).md", then "(restored 2)", … for restoring deleted files. */
+export function restoredPath(path: string, n = 1): string {
+  const [stem, ext] = splitExtension(basename(path));
+  return joinPath(dirname(path), `${stem} (restored${n === 1 ? "" : ` ${n}`})${ext}`);
+}

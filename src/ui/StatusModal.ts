@@ -55,6 +55,12 @@ export class StatusModal extends Modal {
         .setDisabled(syncing)
         .onClick(() => void this.plugin.syncCommand("full")),
     );
+    actions.addButton((b) =>
+      b.setButtonText("Activity").onClick(() => {
+        this.close();
+        this.plugin.openActivity();
+      }),
+    );
     if (this.plugin.store.state.conflicts.length > 0) {
       actions.addButton((b) =>
         b.setButtonText("Show conflicts").onClick(() => {

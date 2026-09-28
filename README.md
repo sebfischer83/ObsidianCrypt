@@ -73,25 +73,44 @@ Requires Obsidian 1.11.4 or newer. Do not use a second sync tool for the same va
 
 * Syncs on startup, ~30 s after the last change, on app resume and optionally every 1–60 minutes.
 * Commands: *Sync now*, *Pull from GitHub*, *Push to GitHub* (always pulls and merges first), *Show status*,
-  *Show conflicts*, *Lock vault*, *Unlock vault*, *Change password*, *Show version history of current note*.
+  *Show conflicts*, *Lock vault*, *Unlock vault*, *Change password*, *Show version history of current note*,
+  *Restore deleted files*, *Show sync activity*, *Verify repository*.
 * Status bar: `☁ Synced`, `☁ 4 pending`, `↻ Syncing`, `☁ Offline · 37 pending`, `⚠ 2 conflicts`, `⚠ Sync error`.
 * **Conflicts** never lose data: if a note was changed on two devices, the remote version keeps the name and
   your version is saved as `Note (conflict 2026-09-26 1a2b3c4d).md`. Delete-vs-modify always keeps the
-  modified version. Remote deletions move files to the vault’s `.trash` folder.
+  modified version. Remote deletions move files to the vault’s `.trash` folder. *Compare* in the conflict list
+  shows a line diff of both versions: keep the synced version, keep your copy (the discarded one goes to the
+  trash, the replaced one stays in the version history) or open both side by side to merge manually.
 * **Version history** for Markdown notes: *Version history* in the file menu or the command *Show version
   history of current note* lists earlier versions (setting *Versions per note*, 1–100, default 20), with
   preview, *Restore* and *Restore as copy*. Versions are decrypted from the encrypted GitHub history – one
   per sync that changed the note, from every device – so nothing extra is stored. Restoring never loses the
   current content: unsynced changes are synced first (or the restore is refused and a copy can be made).
+* **Deleted files** (on any device) can be restored from the encrypted history: settings → *Deleted files* or
+  the command *Restore deleted files*. The file comes back at its old path, or as `Name (restored).ext` if that
+  name is taken – nothing is overwritten.
+* **Sync activity**: a local log of which files each sync downloaded, uploaded, moved or deleted, plus restores
+  and errors (status dialog → *Activity*). Stored only on this device.
+* **Verify repository** downloads and decrypts every file on GitHub and checks it against the encrypted
+  manifest (read-only; about one GitHub request per file).
+* **Large files** (over 4 MB) are uploaded as encrypted 4 MB chunks; after a change only the changed chunks are
+  uploaded again. Maximum file size is configurable up to 256 MB (default 50 MB).
 * `.vaultsyncignore` (gitignore-like) excludes files before encryption. `.obsidian` sync is configurable
   (core settings on by default; plugins, themes/snippets and workspace separately).
 * If the repository was manipulated (force-push, deleted branch, corrupted manifest, foreign vault, newer
   format) synchronisation stops and your local files are left untouched.
 
-## Limits (v1)
+## Upgrading from 0.1.x
 
-* Files larger than the configured maximum (default 50 MB, hard limit 72 MB because of GitHub’s API limits)
-  are skipped and reported.
+This version writes manifest format 2 on its first upload. Devices still running 0.1.x then stop syncing with
+“The repository uses a newer format version. Please update the plugin.” – update the plugin on all devices.
+No data is touched while a device is stopped.
+
+## Limits
+
+* Files larger than the configured maximum (default 50 MB, hard limit 256 MB) are skipped and reported. Large
+  files are held in memory once while syncing, and every version stays in the repository history forever –
+  keep an eye on the repository size (GitHub recommends staying below a few GB).
 * Empty folders are not synchronised.
 * Two files whose names differ only by upper/lower case cannot both be synchronised (case-insensitive
   file systems on Windows/macOS/iOS); the second one is reported and stays local.
@@ -102,7 +121,7 @@ Requires Obsidian 1.11.4 or newer. Do not use a second sync tool for the same va
 
 ```bash
 npm install
-npm test          # 200+ unit, integration, security and randomised tests
+npm test          # unit, integration, security and randomised tests
 npm run build     # typecheck (strict) + bundle to main.js
 ```
 
@@ -118,5 +137,10 @@ Test suites:
   (emulated) GitHub API for plaintext contents, file and folder names.
 * `history.test.ts` – version listing across devices and renames, restore (only when the current content is
   in the history), restore as copy, deleted versions, planted foreign objects, GitHub API requests.
-* `fuzz.test.ts` – randomised two-device sessions (optionally with crashes, restarts and network drops)
+* `chunks.test.ts` – chunked round trips, delta uploads, chunk cleanup on change/rename/delete, history of chunked
+  files, swapped or corrupted chunks, malformed chunk indexes, chunk uploads over the GitHub API.
+* `features.test.ts` – deleted-file restore, repository verification (corrupted/missing/orphaned objects),
+  activity reporting and log, conflict resolution safety, line diff.
+* `fuzz.test.ts` – randomised two-device sessions (optionally with crashes, restarts and network drops;
+  each also with 3-byte chunks)
   checking that local content is never lost and that devices converge (`FUZZ_SEEDS=400 npm test`).

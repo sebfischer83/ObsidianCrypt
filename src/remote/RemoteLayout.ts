@@ -60,3 +60,11 @@ const DEVICE_TRAILER = /^Device: ([0-9a-f-]{36})$/m;
 export function parseCommitDevice(message: string): string | null {
   return DEVICE_TRAILER.exec(message)?.[1] ?? null;
 }
+
+const OBJECT_PATH = /^objects\/([0-9a-f]{2})\/([0-9a-f]{32})$/;
+
+/** Inverse of {@link objectPath}; null for any other path. */
+export function objectIdFromPath(path: string): string | null {
+  const m = OBJECT_PATH.exec(path);
+  return m && m[2]!.startsWith(m[1]!) ? m[2]! : null;
+}

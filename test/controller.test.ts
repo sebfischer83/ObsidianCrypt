@@ -53,6 +53,7 @@ async function flush(): Promise<void> {
 const REPORT: SyncReport = {
   downloaded: 0, localMoves: 0, localDeletes: 0, uploaded: 0, remoteDeletes: 0, commits: [], newConflicts: [],
   failedLocalOps: 0, skippedFiles: 0, nameCollisions: [], morePending: false, recoveredJournal: false, recoveredCommit: false,
+  changes: [],
 };
 
 function setup(settings: Partial<TriggerSettings> = {}, behaviour: (mode: SyncMode, n: number) => Promise<SyncReport> = async () => REPORT) {

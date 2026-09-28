@@ -8,7 +8,7 @@ import type { CryptoProvider } from "./CryptoProvider";
  *   0  4  magic "OVSE"
  *   4  1  envelope version (1)
  *   5  1  algorithm (1 = AES-256-GCM)
- *   6  1  kind (1 object, 2 manifest, 3 key slot)
+ *   6  1  kind (1 object, 2 manifest, 3 key slot, 4 chunk index)
  *   7  1  reserved (0)
  *   8  12 nonce
  *   20 n  ciphertext || 16 byte GCM tag
@@ -34,6 +34,8 @@ export enum EnvelopeKind {
   Object = 1,
   Manifest = 2,
   KeySlot = 3,
+  /** List of the chunks a large file consists of (manifest formatVersion 2). */
+  ChunkIndex = 4,
 }
 
 export interface ParsedEnvelope {
@@ -88,7 +90,7 @@ export function isEnvelope(bytes: Uint8Array): boolean {
   return (
     bytes[4] === ENVELOPE_VERSION &&
     bytes[5] === AlgorithmId.Aes256Gcm &&
-    (bytes[6] === EnvelopeKind.Object || bytes[6] === EnvelopeKind.Manifest || bytes[6] === EnvelopeKind.KeySlot) &&
+    isKnownKind(bytes[6] as number) &&
     bytes[7] === 0
   );
 }
@@ -108,7 +110,7 @@ export function parseEnvelope(bytes: Uint8Array): ParsedEnvelope {
   const algorithm = bytes[5] as number;
   if (algorithm !== AlgorithmId.Aes256Gcm) throw new CryptoError("UnsupportedFormat", `algorithm ${algorithm}`);
   const kind = bytes[6] as number;
-  if (kind !== EnvelopeKind.Object && kind !== EnvelopeKind.Manifest && kind !== EnvelopeKind.KeySlot) {
+  if (!isKnownKind(kind)) {
     throw new CryptoError("UnsupportedFormat", `kind ${kind}`);
   }
   if (bytes[7] !== 0) throw new CryptoError("UnsupportedFormat", "reserved byte");
@@ -127,6 +129,7 @@ export const Contexts = {
   object: (vaultId: string, objectId: string): string => `ovs/v1/object/${vaultId}/${objectId}`,
   manifest: (vaultId: string): string => `ovs/v1/manifest/${vaultId}`,
   keySlot: (vaultId: string, slotId: string, canonicalKdf: string): string => `ovs/v1/keyslot/${vaultId}/${slotId}/${canonicalKdf}`,
+  chunkIndex: (vaultId: string, objectId: string): string => `ovs/v1/chunks/${vaultId}/${objectId}`,
 } as const;
 
 function associatedData(headerPrefix: Uint8Array, context: string): Uint8Array {
@@ -168,4 +171,13 @@ export async function openEnvelope(
     key,
     associatedData(parsed.headerPrefix, context),
   );
+}
+
+function isKnownKind(kind: number): boolean {
+  return kind === EnvelopeKind.Object || kind === EnvelopeKind.Manifest || kind === EnvelopeKind.KeySlot || kind === EnvelopeKind.ChunkIndex;
+}
+
+/** Kind of a structurally valid envelope (not authenticated: only used to choose how to decrypt). */
+export function envelopeKind(bytes: Uint8Array): EnvelopeKind {
+  return parseEnvelope(bytes).kind;
 }

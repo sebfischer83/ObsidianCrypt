@@ -390,6 +390,7 @@ export function planPush(
   let bytes = 0;
   for (const c of included) {
     const id = c.id === "" ? ctx.newObjectId() : c.id;
+    const prior = entries[id];
     entries[id] = {
       path: c.path,
       size: c.size,
@@ -397,6 +398,8 @@ export function planPush(
       modified: c.mtime,
       updatedAtVersion: version,
       updatedBy: ctx.deviceId,
+      // Path-only change: the remote object (possibly a chunk index) stays as it is.
+      ...(!c.upload && isLive(prior) && prior.chunks !== undefined ? { chunks: prior.chunks } : {}),
     };
     if (c.untrackedPath !== undefined) localMap[c.untrackedPath] = id;
     if (c.upload) {

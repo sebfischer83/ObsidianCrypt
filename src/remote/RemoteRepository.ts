@@ -18,6 +18,8 @@ export type HeadState =
 
 export type RemoteChange =
   | { readonly kind: "putObject"; readonly objectId: string; readonly blob: EncryptedBlob }
+  /** An object uploaded beforehand with {@link RemoteRepository.uploadObject} (chunks of large files). */
+  | { readonly kind: "putUploadedObject"; readonly objectId: string; readonly handle: string }
   | { readonly kind: "deleteObject"; readonly objectId: string }
   | { readonly kind: "putManifest"; readonly blob: EncryptedBlob }
   | { readonly kind: "putConfig"; readonly config: PublicVaultConfig };
@@ -55,6 +57,9 @@ export interface RemoteRepository {
    */
   listObjectRevisions(from: string, objectId: string, limit: number): Promise<ObjectRevision[]>;
 
+  /** Ids of all objects in the commit's tree; `complete` is false if the backend truncated the listing. */
+  listObjectIds(commit: string): Promise<{ ids: string[]; complete: boolean }>;
+
   /** True if the commit's tree contains nothing but `.vaultsync/config` (freshly initialised vault). */
   isBootstrapCommit(commit: string): Promise<boolean>;
 
@@ -66,6 +71,12 @@ export interface RemoteRepository {
    * Fails with SyncError("ConcurrentRemoteUpdate") if the branch already exists.
    */
   initialize(config: PublicVaultConfig, meta: CommitMetadata): Promise<string>;
+
+  /**
+   * Uploads an encrypted object without committing it (keeps memory bounded for large files) and returns a
+   * handle for a `putUploadedObject` change. Uploads that are never committed are harmless.
+   */
+  uploadObject(blob: EncryptedBlob): Promise<string>;
 
   /** Creates a commit on top of `parent` (does NOT move the branch). Returns the commit id. */
   createCommit(parent: string, changes: readonly RemoteChange[], meta: CommitMetadata): Promise<string>;

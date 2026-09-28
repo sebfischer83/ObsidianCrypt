@@ -202,7 +202,7 @@ export class SettingsTab extends PluginSettingTab {
       });
     new Setting(containerEl)
       .setName("Maximum file size (MB)")
-      .setDesc(`Larger files are skipped (hard limit ${MAX_FILE_SIZE_MB_LIMIT} MB due to GitHub).`)
+      .setDesc(`Larger files are skipped (hard limit ${MAX_FILE_SIZE_MB_LIMIT} MB). Files over 4 MB are uploaded as encrypted chunks; only changed chunks are uploaded again.`)
       .addText((t) =>
         t.setValue(String(s.maxFileSizeMB)).onChange(async (v) => {
           const n = Number(v);
@@ -227,6 +227,10 @@ export class SettingsTab extends PluginSettingTab {
           .setDynamicTooltip()
           .onChange(async (v) => ((s.versionHistoryLimit = v), await save())),
       );
+    new Setting(containerEl)
+      .setName("Deleted files")
+      .setDesc("Restore files that were deleted on any of your devices.")
+      .addButton((b) => b.setButtonText("Show").onClick(() => this.plugin.openDeletedFiles()));
 
     // ── Diagnostics ──
     new Setting(containerEl).setName("Diagnostics").setHeading();
@@ -235,6 +239,14 @@ export class SettingsTab extends PluginSettingTab {
     }
     new Setting(containerEl).setName("Device ID").setDesc(this.plugin.deviceId);
     new Setting(containerEl).setName("Show conflicts").addButton((b) => b.setButtonText("Open").onClick(() => this.plugin.openConflicts()));
+    new Setting(containerEl)
+      .setName("Sync activity")
+      .setDesc("Which files the synchronisations on this device changed (stored locally only).")
+      .addButton((b) => b.setButtonText("Open").onClick(() => this.plugin.openActivity()));
+    new Setting(containerEl)
+      .setName("Verify repository")
+      .setDesc("Downloads and decrypts every file on GitHub and checks it against the manifest. Read-only.")
+      .addButton((b) => b.setButtonText("Verify").onClick(() => this.plugin.openVerify()));
     new Setting(containerEl)
       .setName("Debug logging")
       .setDesc("Writes technical details to the developer console. Never logs contents, passwords, keys or tokens.")

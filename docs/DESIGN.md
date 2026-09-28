@@ -1,6 +1,6 @@
 # Encrypted GitHub Sync – Design
 
-Status: Version 1 (formatVersion 1). Dieses Dokument deckt die Punkte 1–7 aus Abschnitt 65 des
+Status: Manifest-formatVersion 2 (große Dateien als Chunks, §2.5); Config-formatVersion 1. Dieses Dokument deckt die Punkte 1–7 aus Abschnitt 65 des
 Anforderungsprofils ab. Leitprinzip: **Ein Synchronisationsfehler darf unbequem sein. Ein Datenverlust
 oder Klartext-Leak darf nicht passieren.**
 
@@ -65,6 +65,7 @@ Grundregeln:
 .vaultsync/config          JSON, Klartext, NICHT geheim, MAC-geschützt
 .vaultsync/manifest.enc    verschlüsseltes Manifest (Envelope, kind=manifest)
 objects/<aa>/<id>          verschlüsselte Objekte; <id> = 32 Hex-Zeichen (128 bit zufällig), <aa> = erste 2
+                           (auch Chunks großer Dateien: eigene zufällige IDs im selben Namensraum)
 ```
 
 Keine weiteren Dateien. Commit-Messages: `Encrypted vault sync: <n> changes` mit Trailer
@@ -77,7 +78,7 @@ Keine weiteren Dateien. Commit-Messages: `Encrypted vault sync: <n> changes` mit
 | 0      | 4     | Magic `OVSE` (0x4F 0x56 0x53 0x45)                 |
 | 4      | 1     | Envelope-Version = 1                               |
 | 5      | 1     | Algorithmus: 1 = AES-256-GCM                       |
-| 6      | 1     | Kind: 1 = Objekt, 2 = Manifest, 3 = Key-Slot       |
+| 6      | 1     | Kind: 1 = Objekt/Chunk, 2 = Manifest, 3 = Key-Slot, 4 = Chunk-Index |
 | 7      | 1     | reserviert = 0                                     |
 | 8      | 12    | Nonce (96 bit, CSPRNG, pro Verschlüsselung neu)    |
 | 20     | n     | Ciphertext                                         |
@@ -87,6 +88,8 @@ AAD = `header[0..20) ‖ UTF-8(context)`. Der Kontext wird beim Entschlüsseln r
 nicht gespeichert:
 
 * Objekt: `ovs/v1/object/<vaultId>/<objectId>` → verhindert das Vertauschen von Objekten.
+* Chunk (großer Dateien): wie Objekt, mit der Chunk-ID.
+* Chunk-Index: `ovs/v1/chunks/<vaultId>/<objectId>` (Kind 4).
 * Manifest: `ovs/v1/manifest/<vaultId>`
 * Key-Slot: `ovs/v1/keyslot/<vaultId>/<slotId>/<kanonisches KDF-JSON>` → Manipulation der
   KDF-Parameter führt zu Authentisierungsfehler.
@@ -108,7 +111,7 @@ liefert immer die binären Envelope-Bytes. Armoring ist reine Transportcodierung
 ```json
 {
   "type": "obsidian-encrypted-sync",
-  "formatVersion": 1,
+  "formatVersion": 2,
   "vaultId": "9f2c…(32 hex)",
   "encryption": { "algorithm": "AES-256-GCM", "version": 1 },
   "keyDerivation": { "algorithm": "HKDF-SHA256", "version": 1 },
@@ -129,12 +132,32 @@ Unbekannte `formatVersion` (> unterstützt) → Sync stoppt, keine Schreibzugrif
 
 ---
 
+### 2.5 Große Dateien: Chunks (Manifest-formatVersion 2)
+
+Dateien > 4 MiB (`SyncLimits.chunkSize`) werden in Stücke fester Größe zerlegt. Jedes Stück ist ein normales
+Objekt (Kind 1) mit eigener zufälliger ID; unter der Object-ID der Datei liegt ein verschlüsselter Chunk-Index
+(Kind 4): kanonisches JSON `{"type":"obsidian-encrypted-sync-chunks","chunks":[{"id","size","hash"}…]}`
+(hash = SHA-256 des Chunk-Klartexts). Das Manifest-Feld `chunks: n` markiert solche Einträge.
+
+| Entscheidung | Optionen | Umgesetzt / Begründung |
+|---|---|---|
+| Zerlegung | feste Größe · inhaltsdefiniert (FastCDC) | **feste Größe**: CDC-Grenzen hängen vom Inhalt ab und verraten über die Chunk-Größen etwas über ihn (Fingerprinting); feste Größen verraten nur die Gesamtgröße, die ohnehin sichtbar ist. Nachteil: Einfügen am Anfang ändert alle folgenden Chunks. |
+| Chunk-IDs | zufällig · aus Inhalt abgeleitet (konvergent/HMAC) | **zufällig**: abgeleitete IDs würden gleiche Inhalte über Dateien hinweg für GitHub erkennbar machen. Wiederverwendung nur innerhalb derselben Datei: ein Chunk mit gleichem Hash an gleicher Position wird nicht erneut hochgeladen. |
+| Format | Umstellung bei Bedarf · sofort | **sofort** (Entscheidung des Nutzers): jedes neue Manifest hat `formatVersion: 2`. Ältere Plugin-Versionen stoppen mit „UnknownFormatVersion“ statt Chunk-Indizes falsch zu lesen. formatVersion-1-Manifeste werden weiter gelesen. |
+| Upload | alle Chunks im Commit-Aufruf · einzeln vorab | **einzeln vorab** (`RemoteRepository.uploadObject` → `POST /git/blobs`, danach `putUploadedObject` im Tree): höchstens ein Chunk zusätzlich im Speicher. Nie committete Uploads sind harmlos. |
+
+Integrität: Chunk-Index per GCM an die Object-ID gebunden, jeder Chunk per GCM an seine Chunk-ID und per Hash
+an den Index, die ganze Datei zusätzlich an `contentHash` im Manifest. Erst nach vollständiger Prüfung im
+Speicher wird geschrieben (wie bisher). Nicht mehr referenzierte Chunks (geänderte Stücke, Datei gelöscht oder
+wieder klein) werden im selben Commit aus dem Tree entfernt und bleiben nur in der Historie. Der
+Versionsverlauf funktioniert unverändert, weil sich `objects/<aa>/<id>` (der Index) mit jeder Version ändert.
+
 ## 3. Manifest-Schema (entschlüsselt)
 
 ```json
 {
   "type": "obsidian-encrypted-sync-manifest",
-  "formatVersion": 1,
+  "formatVersion": 2,
   "vaultId": "…",
   "version": 18,
   "parentCommit": "<sha des Parent-Commits oder null>",
@@ -143,6 +166,8 @@ Unbekannte `formatVersion` (> unterstützt) → Sync stoppt, keine Schreibzugrif
   "entries": {
     "13ac…": { "path": "Projekte/Projekt A.md", "size": 18372, "contentHash": "<sha256 hex>",
                "modified": 1790428123000, "updatedAtVersion": 17, "updatedBy": "<deviceId>" },
+    "5b1e…": { "path": "Video.mp4", "size": 91226112, "contentHash": "<sha256 hex>", "modified": 1790428123000,
+               "updatedAtVersion": 17, "updatedBy": "<deviceId>", "chunks": 22 },
     "77e0…": { "deleted": true, "deletedAtVersion": 52, "deletedBy": "<deviceId>" }
   }
 }
@@ -156,6 +181,7 @@ Unbekannte `formatVersion` (> unterstützt) → Sync stoppt, keine Schreibzugrif
   Steuerzeichen, nicht im eigenen Plugin-Ordner, keine doppelten Pfade (NFC + case-insensitiv).
   Ein ungültiges Manifest wird verworfen → Sync stoppt.
 * Content-Hashes stehen nur im verschlüsselten Manifest.
+* `chunks` (optional, ab formatVersion 2): Objekt ist ein Chunk-Index mit so vielen Chunks (§2.5).
 
 ---
 
@@ -300,12 +326,17 @@ werden nie als lokale Löschung interpretiert; ihre Remote-Einträge bleiben unv
 | 20 | Angreifer mit Schreibzugriff hängt altes Manifest an (Replay) | Jeder Manifest-Commit muss direkter Kind-Commit von `manifest.parentCommit` sein; Config-Commits schreiben ebenfalls ein neues Manifest. |
 | 21 | Nicht-portable Namen (`a:b`, `CON`, Endpunkt/-leerzeichen), Plugin-Ordner in anderer Schreibweise | Werden nie synchronisiert (und nie als gelöscht gewertet); eigener Plugin-Ordner case-insensitiv ausgeschlossen. |
 | 16 | Klartext-Upload | Brand-Typ `EncryptedBlob`, Laufzeit-Header-Prüfung, Pfade nur aus Object-IDs, Security-Test durchsucht gesamten Remote-Inhalt inkl. Commit-Messages. |
+| 22 | Wiederherstellen einer Version / „Kopie behalten“ bei Konflikt überschreibt ungesicherten Inhalt | Ersetzen nur, wenn der aktuelle Inhalt dem Remote-Manifest entspricht (also in der Historie liegt); sonst erst Sync, sonst Abbruch (`UnsyncedChanges`). Unter Mutex; Hash-Prüfung des verglichenen Inhalts direkt vor dem Schreiben. Verworfene Konfliktkopie → Papierkorb. |
+| 23 | Gelöschte Datei wiederherstellen überschreibt eine neue Datei gleichen Namens | Nie: belegter Name → `Name (restored).ext`. Inhalt gegen `contentHash` des Manifests vor der Löschung geprüft. |
+| 24 | Chunk fehlt/vertauscht/manipuliert | Chunk-Hash aus dem authentisierten Index + GCM je Chunk + Gesamt-Hash; erst nach vollständiger Prüfung im Speicher wird geschrieben. Fuzz-Tests laufen zusätzlich mit 3-Byte-Chunks. |
 
 ### Bekannte, akzeptierte Metadaten-Leaks
 
 GitHub sieht: Anzahl der Objekte, ungefähre Größen (Ciphertext ≈ Klartext + 36 Byte), Zeitpunkte und
 Häufigkeit von Änderungen pro Objekt, Anzahl Änderungen pro Commit, Device-IDs (zufällig).
-Padding/Chunking ist für spätere Formatversionen vorgesehen.
+Padding ist für eine spätere Formatversion vorgesehen. Chunks fester Größe verraten nichts über die Gesamtgröße
+hinaus; zufällige Chunk-IDs verraten keine gleichen Inhalte (§2.5). Sichtbar wird, welche Chunks einer großen
+Datei sich ändern (grob: welcher Bereich der Datei).
 
 ## 7a. Versionsverlauf (Markdown-Notizen)
 
@@ -337,16 +368,36 @@ Ablauf (`src/sync/VersionHistory.ts`):
   bleibt unberührt (auch mit nicht synchronisierten Änderungen).
 * Konfliktkopien und neu verschlüsselte Objekte erhalten neue Object-IDs; ihre Historie beginnt neu.
 
+## 7b. Gelöschte Dateien, Konfliktauflösung, Aktivitätsprotokoll, Repository-Prüfung
+
+* **Gelöschte Dateien** (`src/sync/DeletedFiles.ts`): Liste aus den Tombstones des letzten Manifests (ohne Netz).
+  Pfad und Hash stehen nicht im Tombstone; aufgelöst über `listObjectRevisions(…, 1)` → Lösch-Commit →
+  dessen Parent → Manifest dort (pro Commit gecacht, seitenweise 20 Dateien). Inhalt voll verifiziert
+  (`contentHash`). Wiederherstellen legt eine neue Datei an (neue Object-ID beim nächsten Sync), nie überschreibend.
+* **Konfliktauflösung** (`src/sync/ConflictResolver.ts`, `src/util/diff.ts`): Zeilen-Diff (Myers, begrenzt auf
+  4000 Änderungen) zwischen kanonischer Datei und Konfliktkopie. „Synchronisierte behalten“ → Kopie in den
+  Papierkorb; „Kopie behalten“ → Inhalt ersetzt die kanonische Datei (Regeln wie beim Wiederherstellen, #22),
+  Kopie in den Papierkorb; „Manuell zusammenführen“ öffnet beide nebeneinander. Beide Aktionen prüfen, dass die
+  Kopie seit dem Vergleich unverändert ist.
+* **Aktivitätsprotokoll** (`src/state/ActivityLog.ts`): `SyncReport.changes` listet jede Datei (↓, ↑, verschoben,
+  gelöscht, Konflikt) sowie Wiederherstellungen und Fehler. Nur lokal im Plugin-Ordner
+  (`activity-<deviceId>.json`), höchstens 200 Einträge × 500 Dateien, gleiche Fehler hintereinander einmal.
+  Enthält Pfade wie die State-Datei, nie Inhalte; wird nie hochgeladen.
+* **Repository prüfen** (`src/sync/RepositoryVerifier.ts`): rein lesend. Config-MAC, Manifest (GCM, Schema,
+  Parent-Bindung, Vorfahre von `lastRemoteCommit`), dann jede Datei herunterladen, entschlüsseln, gegen
+  `contentHash`/Größe prüfen; Ergebnis pro Pfad „fehlt“/„beschädigt“, dazu nicht referenzierte Objekte.
+  Ca. eine Anfrage pro Datei; Abbruch und Rate-Limit liefern einen Teilbericht.
+
 ## 8. Grenzen von Version 1
 
 * Leere Ordner werden nicht synchronisiert.
-* Dateien > `maxFileSize` (Default 50 MB, hartes Maximum 72 MiB: Base64-Request-Bodies müssen unter
-  GitHubs 100-MB-Grenze bleiben) werden übersprungen und im Status gemeldet – niemals als gelöscht gewertet.
-* Objekte werden als ganze Dateien behandelt (Chunking-fähig: eine spätere `formatVersion` kann im Manifest
-  `chunks: [...]` statt eines einzelnen Objekts ergänzen; das Remote-Interface ist davon unabhängig).
+* Dateien > `maxFileSize` (Default 50 MB, hartes Maximum 256 MiB) werden übersprungen und im Status gemeldet –
+  niemals als gelöscht gewertet. Dateien > 4 MiB werden als Chunks übertragen (§2.5); die Grenze setzt der
+  Arbeitsspeicher (Obsidian liest/schreibt nur ganze Dateien) und die Repository-Größe (jede Version bleibt in
+  der Historie).
 * Speicher: pro Commit höchstens `maxBytesPerCommit` (64 MiB) Klartext bzw. `maxFilesPerCommit` (500)
-  Objekte; Downloads werden einzeln entschlüsselt und geschrieben (höchstens eine Datei gleichzeitig im
-  Speicher). WebCrypto benötigt vollständige Buffer; die Sync-Schicht erzeugt keine zusätzlichen Kopien.
+  Objekte; Chunks werden einzeln verschlüsselt und vorab hochgeladen. Downloads werden einzeln entschlüsselt
+  und geschrieben (höchstens eine Datei plus ein Chunk gleichzeitig im Speicher).
 * Keine Schlüssel-Revocation einzelner Geräte.
 * Zwei Dateien, die sich nur in Groß-/Kleinschreibung unterscheiden (nur auf Linux möglich), können nicht
   beide synchronisiert werden; die zweite bleibt lokal und wird gemeldet (`nameCollisions`).
@@ -364,12 +415,15 @@ src/manifest   Manifest, ManifestCodec (strikte Validierung), VaultConfig (öffe
 src/remote     RemoteRepository (Interface), RemoteLayout (Pfade, Armor, Commit-Messages)
 src/github     HttpClient, GitHubAuth (PAT), GitHubClient (Retry/Backoff/Rate-Limit), GitObjectsApi,
                GitHubRemoteRepository
-src/sync       SyncEngine, ChangeDetector, SyncPlanner (3-Wege-Merge), ConflictNaming, SyncMutex,
+src/sync       SyncEngine, ChangeDetector, SyncPlanner (3-Wege-Merge), ConflictNaming, SyncMutex, ChunkedContent,
+               VersionHistory, DeletedFiles, ConflictResolver, RepositoryVerifier, HistoryReader, LocalContent,
                SyncController (Trigger), VaultSetup (Init/Connect/Passwort/Recovery)
 src/vault      LocalFileSystem, VaultScanner, VaultWriter (Journal-Ops), IgnoreMatcher, SyncFilter, PathUtils
-src/state      LocalState, StateRepository (2-Generationen + Prüfsumme), SyncStateStore, SecretStore
+src/state      LocalState, StateRepository (2-Generationen + Prüfsumme), SyncStateStore, SecretStore, ActivityLog
 src/platform   Obsidian-Adapter (FileSystem, requestUrl, SecretStorage, Plugin-Ordner, localStorage)
-src/ui         SettingsTab, SetupWizard, StatusBar, ConflictView, Modals
+src/ui         SettingsTab, SetupWizard, StatusBar, ConflictView, Modals, VersionHistoryModal, DeletedFilesModal,
+               VerifyModal, ActivityModal, DiffView
+src/util       bytes, canonicalJson, validate, Logger, diff (Myers)
 src/errors     VaultSyncError, CryptoError, GitHubError, SyncError
 ```
 
@@ -387,10 +441,11 @@ Nur `src/platform`, `src/ui` und `src/main.ts` importieren `obsidian`.
   nach Klartext (UTF-8, NFC/NFD, UTF-16, JSON-escaped, Base64 in allen Ausrichtungen).
 * Randomisierte Zwei-Geräte-Sitzungen (mit/ohne Crashes, Neustarts, Netzabbrüche) prüfen die Invariante
   „lokaler Inhalt bleibt im Vault, im Papierkorb oder in der Remote-Historie“ sowie Konvergenz. Diese Tests
-  haben zwei Fehler bei case-insensitiven Dateisystemen gefunden (behoben, siehe `ChangeDetector`).
+  haben zwei Fehler bei case-insensitiven Dateisystemen gefunden (behoben, siehe `ChangeDetector`). Beide
+  Fuzz-Suiten laufen zusätzlich mit 3-Byte-Chunks, sodass fast jede Datei als Chunk-Index übertragen wird.
 
 ## 11. Offen / Phase 7
 
 * Manuelle Tests auf iOS und Android (Speicherverbrauch großer Anhänge, Suspend/Resume, Keychain-Verfügbarkeit).
 * Optional: automatische Repository-Erstellung, GitHub-App/OAuth-Device-Flow (Interface `AuthProvider`
-  vorhanden), Tombstone-Garbage-Collection, Chunking, Größen-Padding.
+  vorhanden), Tombstone-Garbage-Collection, Größen-Padding, Schlüsselrotation (Geräte-Widerruf).

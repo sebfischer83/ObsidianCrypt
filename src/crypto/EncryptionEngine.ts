@@ -54,6 +54,17 @@ export class EncryptionEngine {
     return openEnvelope(this.crypto, this.keys.objectKey, EnvelopeKind.Object, envelope, Contexts.object(this.keys.vaultId, objectId));
   }
 
+  /** The chunk list of a large file, stored at the file's own object id (manifest formatVersion 2). */
+  async encryptChunkIndex(objectId: string, plaintext: Uint8Array): Promise<EncryptedBlob> {
+    assertObjectId(objectId);
+    return sealEnvelope(this.crypto, this.keys.objectKey, EnvelopeKind.ChunkIndex, plaintext, Contexts.chunkIndex(this.keys.vaultId, objectId));
+  }
+
+  async decryptChunkIndex(objectId: string, envelope: Uint8Array): Promise<Uint8Array> {
+    assertObjectId(objectId);
+    return openEnvelope(this.crypto, this.keys.objectKey, EnvelopeKind.ChunkIndex, envelope, Contexts.chunkIndex(this.keys.vaultId, objectId));
+  }
+
   async encryptManifest(plaintext: Uint8Array): Promise<EncryptedBlob> {
     return sealEnvelope(this.crypto, this.keys.manifestKey, EnvelopeKind.Manifest, plaintext, Contexts.manifest(this.keys.vaultId));
   }

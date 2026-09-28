@@ -7,8 +7,10 @@ import { isLive } from "../manifest/Manifest";
 import type { ObjectRevision, RemoteRepository } from "../remote/RemoteRepository";
 import type { SyncStateStore } from "../state/SyncStateStore";
 import type { LocalFileSystem } from "../vault/LocalFileSystem";
-import { pathKey } from "../vault/PathUtils";
+import { isSyncedContent, trackedObjectId } from "./LocalContent";
+import { readObjectContent } from "./ChunkedContent";
 import { versionCopyPath } from "./ConflictNaming";
+import { HARD_MAX_FILE_SIZE } from "./SyncEngine";
 
 /** Upper bound for the number of listed versions (GitHub returns at most 100 commits per page). */
 export const MAX_VERSION_LIMIT = 100;
@@ -42,12 +44,7 @@ export class VersionHistory {
 
   /** Object id tracked for a vault path, or null if the file was never synchronised. */
   objectIdFor(path: string): string | null {
-    const map = this.o.store.state.localMap;
-    const direct = map[path];
-    if (direct !== undefined) return direct;
-    const key = pathKey(path);
-    for (const [tracked, id] of Object.entries(map)) if (pathKey(tracked) === key) return id;
-    return null;
+    return trackedObjectId(this.o.store.state, path);
   }
 
   /** Versions of the file as of the last synchronised commit, newest first. */
@@ -64,26 +61,18 @@ export class VersionHistory {
   async load(version: FileVersion): Promise<Uint8Array | null> {
     const keys = this.o.getKeys();
     if (keys.vaultId !== this.o.store.state.vaultId) throw SyncError.blocked("ForeignVault");
-    let envelope: Uint8Array;
+    const engine = new EncryptionEngine(this.o.crypto, keys);
     try {
-      envelope = await this.o.remote.readObject(version.commit, version.objectId);
+      return await readObjectContent(this.o.remote, engine, version.commit, version.objectId, null, HARD_MAX_FILE_SIZE);
     } catch (error: unknown) {
       if (error instanceof GitHubError && error.category === "NotFound") return null;
       throw error;
     }
-    return new EncryptionEngine(this.o.crypto, keys).decryptObjectRevision(version.objectId, envelope);
   }
 
   /** True if the file's current content is stored in the remote history (replacing it loses nothing). */
   async isCurrentContentSynced(path: string, objectId: string): Promise<boolean> {
-    if (this.objectIdFor(path) !== objectId) return false;
-    const entry = this.o.store.state.remote?.entries[objectId];
-    if (!isLive(entry)) return false;
-    try {
-      return (await this.o.crypto.hash(await this.o.fs.read(path))) === entry.contentHash;
-    } catch {
-      return false;
-    }
+    return isSyncedContent(this.o.store.state, this.o.crypto, this.o.fs, path, objectId);
   }
 
   /**

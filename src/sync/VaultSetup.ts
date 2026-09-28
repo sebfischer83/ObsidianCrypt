@@ -12,7 +12,7 @@ import { SyncError } from "../errors/SyncError";
 import { parseVaultConfig, type PublicVaultConfig } from "../manifest/VaultConfig";
 import type { RemoteChange, RemoteRepository } from "../remote/RemoteRepository";
 import { EncryptionEngine } from "../crypto/EncryptionEngine";
-import type { Manifest } from "../manifest/Manifest";
+import { MANIFEST_FORMAT_VERSION, type Manifest } from "../manifest/Manifest";
 import { decodeManifest, encodeManifest } from "../manifest/ManifestCodec";
 import { newLocalState } from "../state/LocalState";
 import type { SyncStateStore } from "../state/SyncStateStore";
@@ -152,7 +152,7 @@ async function updateRemoteConfig(
         if (error instanceof SyncError) throw error;
         throw SyncError.blocked("ManifestCorrupted", { cause: error });
       }
-      const updated: Manifest = { ...current, version: current.version + 1, parentCommit: head.commit, device: deviceId, updatedAt: Date.now() };
+      const updated: Manifest = { ...current, formatVersion: MANIFEST_FORMAT_VERSION, version: current.version + 1, parentCommit: head.commit, device: deviceId, updatedAt: Date.now() };
       changes.push({ kind: "putManifest", blob: await engine.encryptManifest(encodeManifest(updated)) });
     }
     const commit = await remote.createCommit(head.commit, changes, {

@@ -5,6 +5,12 @@
 
 export const MANIFEST_TYPE = "obsidian-encrypted-sync-manifest";
 
+/**
+ * Manifest format written by this version. 2 = objects of large files may be chunk indexes (`chunks`).
+ * Older plugin versions stop with "UnknownFormatVersion" instead of misreading such objects.
+ */
+export const MANIFEST_FORMAT_VERSION = 2;
+
 export interface LiveEntry {
   readonly path: string;
   readonly size: number;
@@ -14,6 +20,8 @@ export interface LiveEntry {
   readonly modified: number;
   readonly updatedAtVersion: number;
   readonly updatedBy: string;
+  /** Number of chunks if the object is a chunk index (large file); absent for single objects. */
+  readonly chunks?: number;
 }
 
 export interface Tombstone {
@@ -45,7 +53,7 @@ export function isTombstone(entry: ManifestEntry | undefined | null): entry is T
   return !!entry && "deleted" in entry && entry.deleted === true;
 }
 
-export function emptyManifest(vaultId: string, device: string, formatVersion = 1): Manifest {
+export function emptyManifest(vaultId: string, device: string, formatVersion = MANIFEST_FORMAT_VERSION): Manifest {
   return {
     type: MANIFEST_TYPE,
     formatVersion,

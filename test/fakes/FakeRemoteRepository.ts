@@ -1,9 +1,10 @@
 import { GitHubError } from "../../src/errors/GitHubError";
 import { SyncError } from "../../src/errors/SyncError";
 import { serializeVaultConfig, type PublicVaultConfig } from "../../src/manifest/VaultConfig";
-import { assertEncrypted, CONFIG_PATH, MANIFEST_PATH, objectPath, parseCommitDevice } from "../../src/remote/RemoteLayout";
+import { assertEncrypted, CONFIG_PATH, MANIFEST_PATH, objectIdFromPath, objectPath, parseCommitDevice } from "../../src/remote/RemoteLayout";
 import type { CommitMetadata, HeadState, ObjectRevision, RemoteChange, RemoteRepository } from "../../src/remote/RemoteRepository";
 import { toHex } from "../../src/util/bytes";
+import type { EncryptedBlob } from "../../src/crypto/EncryptionFormat";
 
 interface Commit {
   readonly sha: string;
@@ -106,6 +107,12 @@ export class FakeRemoteRepository implements RemoteRepository {
     return out;
   }
 
+  async listObjectIds(commit: string): Promise<{ ids: string[]; complete: boolean }> {
+    this.touch();
+    const ids = [...this.commit(commit).files.keys()].map(objectIdFromPath).filter((id): id is string => id !== null);
+    return { ids, complete: true };
+  }
+
   async isBootstrapCommit(commit: string): Promise<boolean> {
     this.touch();
     const files = [...this.commit(commit).files.keys()];
@@ -127,6 +134,17 @@ export class FakeRemoteRepository implements RemoteRepository {
     return sha;
   }
 
+  /** Uploaded but not yet committed objects (like git blobs without a tree). */
+  readonly uploads = new Map<string, Uint8Array>();
+
+  async uploadObject(blob: EncryptedBlob): Promise<string> {
+    this.touch();
+    assertEncrypted(blob.bytes);
+    const handle = `upload-${this.uploads.size + 1}`;
+    this.uploads.set(handle, blob.bytes.slice());
+    return handle;
+  }
+
   async createCommit(parent: string, changes: readonly RemoteChange[], meta: CommitMetadata): Promise<string> {
     this.touch();
     const files = new Map(this.commit(parent).files);
@@ -136,6 +154,12 @@ export class FakeRemoteRepository implements RemoteRepository {
           assertEncrypted(change.blob.bytes);
           files.set(objectPath(change.objectId), change.blob.bytes.slice());
           break;
+        case "putUploadedObject": {
+          const uploaded = this.uploads.get(change.handle);
+          if (!uploaded) throw new GitHubError("InvalidResponse");
+          files.set(objectPath(change.objectId), uploaded);
+          break;
+        }
         case "deleteObject":
           files.delete(objectPath(change.objectId));
           break;
@@ -192,6 +216,7 @@ export class FakeRemoteRepository implements RemoteRepository {
   everythingStored(): Uint8Array[] {
     const out: Uint8Array[] = [];
     const enc = new TextEncoder();
+    out.push(...this.uploads.values());
     for (const c of this.commits.values()) {
       out.push(enc.encode(c.message));
       for (const [path, data] of c.files) {

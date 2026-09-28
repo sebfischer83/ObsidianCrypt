@@ -1,10 +1,11 @@
 import { GitHubError } from "../errors/GitHubError";
 import { SyncError } from "../errors/SyncError";
 import { serializeVaultConfig, type PublicVaultConfig } from "../manifest/VaultConfig";
-import { armor, assertEncrypted, CONFIG_PATH, MANIFEST_PATH, objectPath, parseCommitDevice, unarmor } from "../remote/RemoteLayout";
+import { armor, assertEncrypted, CONFIG_PATH, MANIFEST_PATH, objectIdFromPath, objectPath, parseCommitDevice, unarmor } from "../remote/RemoteLayout";
 import type { CommitMetadata, HeadState, ObjectRevision, RemoteChange, RemoteRepository } from "../remote/RemoteRepository";
 import { toBase64, utf8Decode } from "../util/bytes";
-import { ValidationError } from "../util/validate";
+import { GIT_SHA, ValidationError } from "../util/validate";
+import type { EncryptedBlob } from "../crypto/EncryptionFormat";
 import type { GitObjectsApi, TreeEntryInput } from "./GitObjectsApi";
 
 export interface GitHubRemoteOptions {
@@ -66,6 +67,12 @@ export class GitHubRemoteRepository implements RemoteRepository {
     return commits.slice(0, limit).map((c) => ({ commit: c.sha, date: c.date, device: parseCommitDevice(c.message) }));
   }
 
+  async listObjectIds(commit: string): Promise<{ ids: string[]; complete: boolean }> {
+    const tree = await this.api.getTree(await this.api.getCommitTree(commit), true);
+    const ids = tree.entries.filter((e) => e.type === "blob").map((e) => objectIdFromPath(e.path)).filter((id): id is string => id !== null);
+    return { ids, complete: !tree.truncated };
+  }
+
   async isBootstrapCommit(commit: string): Promise<boolean> {
     const tree = await this.api.getTree(await this.api.getCommitTree(commit), true);
     const blobs = tree.entries.filter((e) => e.type === "blob").map((e) => e.path);
@@ -94,6 +101,11 @@ export class GitHubRemoteRepository implements RemoteRepository {
     return commit;
   }
 
+  async uploadObject(blob: EncryptedBlob): Promise<string> {
+    assertEncrypted(blob.bytes);
+    return this.api.createBlobBase64(toBase64(blob.bytes));
+  }
+
   async createCommit(parent: string, changes: readonly RemoteChange[], meta: CommitMetadata): Promise<string> {
     const entries: Array<TreeEntryInput & { inlineBytes: number }> = [];
     for (const change of changes) {
@@ -112,6 +124,10 @@ export class GitHubRemoteRepository implements RemoteRepository {
           }
           break;
         }
+        case "putUploadedObject":
+          if (!GIT_SHA.test(change.handle)) throw new GitHubError("InvalidResponse");
+          entries.push({ path: objectPath(change.objectId), mode: "100644", type: "blob", sha: change.handle, inlineBytes: 0 });
+          break;
         case "deleteObject":
           entries.push({ path: objectPath(change.objectId), mode: "100644", type: "blob", sha: null, inlineBytes: 0 });
           break;
