@@ -582,3 +582,46 @@ Objektspeicher nach (`ObjectStoreRepository` über einem minimalen `BlobStore`; 
   `create`. `main.ts` baut Remotes nur noch über die Registry.
 * Konformitäts-Suite (`test/fakes/conformance.ts`) legt den Vertrag von `RemoteRepository` fest und läuft gegen
   jedes Backend; `twoDevicesOn(factory)` führt die Sync-Szenarien auf beliebigen Backends aus.
+
+**Stand Phase 1 (Objektspeicher-Kern, noch nicht in der Oberfläche):**
+
+* `src/store/BlobStore.ts`: `get` (mit Größengrenze), `create` (nur anlegen, If-None-Match), `replace` (If-Match,
+  ok:false bei veralteter ETag, unklarer Ausgang → Network), `listChildren`, `deleteOwnProbe` (einzig erlaubtes
+  Löschen, nur `probe/`). `casAtomic` = false für WebDAV.
+* Layout unter dem Präfix: `vault.json` (Markierung, Layout-Version), `HEAD` {commit, seq} (einziger veränderlicher
+  Schlüssel), `commits/<aa>/<id>` (zufällige 64-hex-IDs, Parent + Sprungzeiger auf `seq & (seq-1)`),
+  `trees/<aa>/<sha256>` (Wurzel mit 256-fach Fanout, Subtrees mit Blättern {aktueller Blob, ≤ 8 neueste Revisionen,
+  Seite älterer Revisionen}, Revisionsseiten), `blobs/<aa>/<sha256>` (Envelopes und öffentliche Config).
+  Inhaltsadressiertes wird beim Lesen per Hash geprüft; Commit-Records müssen ihre eigene ID enthalten und eine der
+  festen Nachrichten des Plugins tragen.
+* `ObjectStoreRepository` erfüllt die Konformitäts-Suite. `updateHead`: HEAD mit ETag lesen → Parent und `seq` prüfen
+  → bedingtes Ersetzen; veraltet → nachlesen („schon gelandet?“, sonst `ConcurrentRemoteUpdate`); unklarer Ausgang →
+  nachlesen; bei nicht-atomarem CAS nach kurzer Pause erneut prüfen, bevor etwas als erledigt gilt.
+* `initialize` nur auf leerem Ort oder Resten eines abgebrochenen Setups dieses Plugins; ein Ort mit Commits
+  (seq ≥ 1) ohne HEAD wird nie überschrieben. Vorher `probeStore`: Server, die bedingte Writes ignorieren, keine
+  starken ETags liefern oder nicht read-after-write-konsistent sind, werden abgelehnt (`RemoteError("Unsupported")`).
+* Tests: Konformität (auch mit nicht-atomarem CAS), Ende-zu-Ende-Sync, Versionsverlauf mit Revisionsseiten, gelöschte
+  Dateien, Chunks, Umzug GitHub-artig → Objektspeicher inkl. Historie, Abstürze an **jedem** Schreibvorgang eines
+  Pushs (vorher/nachher/unklar), Fuzz-Sitzungen mit zufälligen Fehlern an beliebigen Schreibvorgängen.
+* Offen für Phase 3: Hat ein nicht-atomarer Server ein Head-Update überschrieben, nachdem das Gerät es als gelandet
+  geprüft hat, blockiert der nächste Sync dieses Geräts sicher (`HistoryRewritten`, keine lokalen Änderungen); die
+  automatische Neu-Zusammenführung (`LostUpdate`) folgt mit dem WebDAV-Backend.
+
+Review des Kerns (1 hoch, 4 mittel, 11 niedrig) – umgesetzt:
+
+* **Hoch:** Bei nicht-atomarem CAS lief ein unklarer Netzwerkausgang (oder „schon gelandet“) an der Nachprüfung vorbei.
+  Jetzt endet jeder Erfolgspfad von `updateHead` in `confirmLanded` (Pause, HEAD erneut lesen, eigener Commit muss
+  enthalten sein).
+* Probe: vier Ersetzungen gleicher Größe direkt hintereinander, jede ETag muss neu und stark sein (ETags aus
+  Änderungszeit + Größe werden abgelehnt). Die Probe läuft einmal pro Sitzung und Speicherort **vor dem ersten
+  Schreibvorgang jedes Geräts**, nicht nur beim Einrichten (z. B. Proxy, der Bedingungen entfernt).
+* Hash-Abweichung gespeicherter Daten → `CryptoError("IntegrityMismatch")` (Verify meldet „beschädigt“ und prüft weiter,
+  ein fortgesetzter Umzug kopiert neu).
+* Pro Commit höchstens eine Änderung je Objekt; No-Ops (Löschen von Gelöschtem, gleicher Blob) erzeugen keine Revision
+  und schreiben keinen Subtree. `putUploadedObject` nur mit existierendem Blob. Cache-Schlüssel enthalten Art und
+  Bucket. Layout-Marker wird auch beim normalen Lesen geprüft (neueres Layout → „Plugin aktualisieren“). Ein „exists“
+  ohne lesbares Objekt wird einmal wiederholt. Sequenznummern ≤ 2³¹−1, jeder Sprungzeiger-Link wird geprüft,
+  Schlüssel ohne `.`-Segmente, parallele Uploads brechen nach dem ersten Fehler ab.
+* Für Phase 2/3 festgehalten: `casAtomic = true` nur für Anbieter mit nachgewiesen atomaren bedingten Writes (AWS S3);
+  unbekannte S3-kompatible Server laufen mit Nachprüfung. Ein Schreiber, der langsamer als das Prüffenster ist, wird
+  beim nächsten Sync erkannt (Block statt Verlust); die automatische Neu-Zusammenführung folgt in Phase 3.

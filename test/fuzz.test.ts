@@ -3,23 +3,54 @@ import { Contexts, envelopeKind, EnvelopeKind, openEnvelope } from "../src/crypt
 import { decodeChunkIndex } from "../src/sync/ChunkedContent";
 import type { SyncLimits } from "../src/sync/SyncEngine";
 import { concatBytes } from "../src/util/bytes";
-import { crypto, twoDevices, type Device } from "./fakes/harness";
+import { crypto, twoDevices, twoDevicesOn, type Device } from "./fakes/harness";
 import { CrashError, FakeRemoteRepository } from "./fakes/FakeRemoteRepository";
 import { SyncError } from "../src/errors/SyncError";
 import { followMove, moveVault } from "../src/sync/VaultMigration";
 import { changeVaultPassword } from "../src/sync/VaultSetup";
 import { RemoteError } from "../src/errors/RemoteError";
+import { ObjectStoreRepository } from "../src/store/ObjectStoreRepository";
+import { parseCommit, parseRoot, parseSub } from "../src/store/StoreRecords";
+import { MemoryBlobStore, StoreCrash } from "./fakes/MemoryBlobStore";
 
-/** Every plaintext ever committed (recoverable from the git history), chunked files reassembled. */
-async function remoteHistory(remote: FakeRemoteRepository, device: Device): Promise<Set<string>> {
-  const out = new Set<string>();
-  const open = (kind: EnvelopeKind, data: Uint8Array, context: string): Promise<Uint8Array> => openEnvelope(crypto, device.keys.objectKey, kind, data, context);
-  for (const commit of remote.commits.values()) {
+/** Every commit's objects (object id → stored envelope) of a fake git remote. */
+function fakeSnapshots(remote: FakeRemoteRepository): Array<Map<string, Uint8Array>> {
+  return [...remote.commits.values()].map((commit) => {
     const objects = new Map<string, Uint8Array>();
     for (const [path, data] of commit.files) {
       const m = path.match(/^objects\/[0-9a-f]{2}\/([0-9a-f]{32})$/);
       if (m) objects.set(m[1] as string, data);
     }
+    return objects;
+  });
+}
+
+/** The same for an object store: every commit record, its root and subtrees. */
+function storeSnapshots(store: MemoryBlobStore): Array<Map<string, Uint8Array>> {
+  const out: Array<Map<string, Uint8Array>> = [];
+  const get = (key: string): Uint8Array => (store.objects.get(key) as { bytes: Uint8Array }).bytes;
+  for (const key of store.objects.keys()) {
+    const m = key.match(/^commits\/[0-9a-f]{2}\/([0-9a-f]{64})$/);
+    if (!m) continue;
+    const commit = parseCommit(get(key), m[1] as string);
+    const root = parseRoot(get(`trees/${commit.root.slice(0, 2)}/${commit.root}`));
+    const objects = new Map<string, Uint8Array>();
+    for (const [bucket, subId] of Object.entries(root.f)) {
+      for (const [id, leaf] of Object.entries(parseSub(get(`trees/${subId.slice(0, 2)}/${subId}`), bucket).e)) {
+        if (leaf.b) objects.set(id, get(`blobs/${leaf.b.slice(0, 2)}/${leaf.b}`));
+      }
+    }
+    out.push(objects);
+  }
+  return out;
+}
+
+/** Every plaintext ever committed (recoverable from the history), chunked files reassembled. */
+async function remoteHistory(remote: FakeRemoteRepository | ObjectStoreRepository, device: Device): Promise<Set<string>> {
+  const out = new Set<string>();
+  const open = (kind: EnvelopeKind, data: Uint8Array, context: string): Promise<Uint8Array> => openEnvelope(crypto, device.keys.objectKey, kind, data, context);
+  const snapshots = remote instanceof FakeRemoteRepository ? fakeSnapshots(remote) : storeSnapshots(remote.store as MemoryBlobStore);
+  for (const objects of snapshots) {
     const chunkIds = new Set<string>();
     const indexes: Array<ReturnType<typeof decodeChunkIndex>> = [];
     for (const [id, data] of objects) {
@@ -88,7 +119,7 @@ function contents(device: Device): Set<string> {
   return out;
 }
 
-async function syncChecked(device: Device, remote: FakeRemoteRepository): Promise<void> {
+async function syncChecked(device: Device, remote: FakeRemoteRepository | ObjectStoreRepository): Promise<void> {
   const before = new Set(Object.values(device.fs.snapshot()));
   await device.sync();
   const after = contents(device);
@@ -242,3 +273,50 @@ describe("randomised sessions with a vault move in the middle", () => {
     });
   }
 });
+
+for (const chunked of [false, true]) {
+  describe(`randomised sessions on the object store with faults at any write${chunked ? " (chunked)" : ""}`, () => {
+    const SEEDS = Number(fuzzSeeds() ?? 40);
+    const kinds = ["crashBefore", "crashAfter", "ambiguous"] as const;
+    for (let seed = 1; seed <= SEEDS; seed++) {
+      it(`seed ${seed}`, async () => {
+        const rnd = prng(seed * 31337 + (chunked ? 1 : 0));
+        const store = new MemoryBlobStore();
+        const remote = new ObjectStoreRepository(store, { crypto, skipProbe: true, verifyDelayMs: 0, sleep: async () => undefined });
+        const { a, b } = await twoDevicesOn(() => remote, chunked ? { chunkSize: 3 } : {});
+        const counter = { n: 0 };
+        const attempt = async (d: Device): Promise<void> => {
+          const before = new Set(Object.values(d.fs.snapshot()));
+          const r = rnd();
+          if (r < 0.2) store.fault = { at: store.writeCount + 1 + Math.floor(rnd() * 12), kind: kinds[Math.floor(rnd() * kinds.length)] ?? "crashAfter" };
+          else if (r < 0.3) store.offline = true;
+          try {
+            await d.sync();
+            if (rnd() < 0.1) await changeVaultPassword({ crypto, remote, store: d.store, keys: d.keys, deviceId: d.deviceId, newPassword: `password number ${counter.n++} long enough` });
+          } catch (error: unknown) {
+            if (!(error instanceof StoreCrash) && !(error instanceof RemoteError) && !(error instanceof SyncError && error.code === "ConcurrentRemoteUpdate")) throw error;
+            if (error instanceof StoreCrash || rnd() < 0.5) await d.restart();
+          } finally {
+            store.fault = null;
+            store.offline = false;
+          }
+          const after = contents(d);
+          const history = await remoteHistory(remote, d);
+          for (const c of before) expect(after.has(c) || history.has(c), `lost local content "${c}"`).toBe(true);
+        };
+        for (let round = 0; round < 6; round++) {
+          randomOps(a, rnd, "A", counter);
+          randomOps(b, rnd, "B", counter);
+          for (const d of rnd() < 0.5 ? [a, b] : [b, a]) await attempt(d);
+        }
+        for (let i = 0; i < 3; i++) {
+          await syncChecked(a, remote);
+          await syncChecked(b, remote);
+        }
+        expect(a.fs.snapshot()).toEqual(b.fs.snapshot());
+        expect(await a.engine.countPendingChanges()).toBe(0);
+        expect(await b.engine.countPendingChanges()).toBe(0);
+      });
+    }
+  });
+}
