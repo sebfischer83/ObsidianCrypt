@@ -106,3 +106,7 @@
   content: "◌";
   color: var(--text-faint);
 }
+
+.encrypted-sync-group {
+  cursor: pointer;
+}
