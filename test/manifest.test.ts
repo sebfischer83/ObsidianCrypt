@@ -77,7 +77,7 @@ describe("manifest", () => {
   it("rejects unknown fields, foreign vaults and newer formats", () => {
     expectBlocked(() => decodeManifest(utf8Encode(JSON.stringify({ ...sample(), extra: 1 })), VAULT), "ManifestCorrupted");
     expectBlocked(() => decodeManifest(encodeManifest(sample()), "f".repeat(32)), "ForeignVault");
-    expectBlocked(() => decodeManifest(utf8Encode(JSON.stringify({ ...sample(), formatVersion: 4 })), VAULT), "UnknownFormatVersion");
+    expectBlocked(() => decodeManifest(utf8Encode(JSON.stringify({ ...sample(), formatVersion: 5 })), VAULT), "UnknownFormatVersion");
     expectBlocked(() => decodeManifest(utf8Encode("not json"), VAULT), "ManifestCorrupted");
   });
 
@@ -117,5 +117,15 @@ describe("manifest format 3 (moved vaults)", () => {
     ]) {
       expectBlocked(() => decodeManifest(utf8Encode(JSON.stringify({ ...m, movedTo: bad })), VAULT), "ManifestCorrupted");
     }
+  });
+});
+
+describe("manifest format 4 (config binding)", () => {
+  it("requires the config hash from format 4 on and rejects it before", () => {
+    const hash = "e".repeat(64);
+    expect(decodeManifest(utf8Encode(JSON.stringify({ ...sample(), formatVersion: 4, configHash: hash })), VAULT).configHash).toBe(hash);
+    expectBlocked(() => decodeManifest(utf8Encode(JSON.stringify({ ...sample(), formatVersion: 4 })), VAULT), "ManifestCorrupted");
+    expectBlocked(() => decodeManifest(utf8Encode(JSON.stringify({ ...sample(), formatVersion: 3, configHash: hash })), VAULT), "ManifestCorrupted");
+    expectBlocked(() => decodeManifest(utf8Encode(JSON.stringify({ ...sample(), formatVersion: 4, configHash: "xyz" })), VAULT), "ManifestCorrupted");
   });
 });

@@ -81,6 +81,7 @@ export class SyncStateStore {
         const entry = this.current.hashCache[path];
         delete this.current.hashCache[path];
         if (entry) this.current.hashCache[target] = entry;
+        changed = true;
       }
     }
     if (changed) this.dirty = true;

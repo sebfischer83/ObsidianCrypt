@@ -12,7 +12,8 @@ import { SyncError } from "../errors/SyncError";
 import { parseVaultConfig, type PublicVaultConfig } from "../manifest/VaultConfig";
 import type { RemoteChange, RemoteRepository } from "../remote/RemoteRepository";
 import { EncryptionEngine } from "../crypto/EncryptionEngine";
-import { formatVersionFor, type Manifest } from "../manifest/Manifest";
+import { MANIFEST_FORMAT_VERSION, type Manifest } from "../manifest/Manifest";
+import { checkConfigBinding, configHashOf, verifiedConfig } from "./HistoryReader";
 import { decodeManifest, encodeManifest } from "../manifest/ManifestCodec";
 import { newLocalState } from "../state/LocalState";
 import type { SyncStateStore } from "../state/SyncStateStore";
@@ -121,63 +122,74 @@ export async function summarizeLocalFiles(fs: LocalFileSystem, filter: SyncFilte
 }
 
 /**
- * Replaces the public config with a transformed version (password change, recovery key) using the same
- * compare-and-swap discipline as data commits. Data objects and the manifest are untouched.
+ * Publishes a changed public config (password / recovery key). Must run under the SyncMutex right after a
+ * successful sync: the remote head must be the last synchronised commit, and the new manifest is derived
+ * from the LOCAL, fully verified state – never from whatever the remote currently serves (an attacker could
+ * otherwise get an older manifest re-signed). Throws SyncError("ConcurrentRemoteUpdate") if the remote moved
+ * on; the caller syncs and retries. Data objects are untouched.
  */
 async function updateRemoteConfig(
   crypto: CryptoProvider,
   remote: RemoteRepository,
+  store: SyncStateStore,
   keys: VaultKeys,
   deviceId: string,
   transform: (config: PublicVaultConfig) => Promise<PublicVaultConfig>,
 ): Promise<PublicVaultConfig> {
-  for (let attempt = 0; attempt < 4; attempt++) {
-    const head = await remote.getHead();
-    if (head.kind !== "ok") throw SyncError.blocked("BranchDeleted");
-    const bytes = await remote.readConfig(head.commit);
-    if (!bytes) throw SyncError.blocked("ConfigMissing");
-    const config = parseVaultConfig(bytes);
-    if (config.vaultId !== keys.vaultId) throw SyncError.blocked("ForeignVault");
-    if (!(await keys.verifyConfigMac(crypto, config))) throw SyncError.blocked("ConfigCorrupted");
-    const next = await transform(config);
-    const changes: RemoteChange[] = [{ kind: "putConfig", config: next }];
-    // Every commit that carries a manifest must carry one created on top of its parent (replay protection).
-    const manifestBytes = await remote.readManifest(head.commit);
-    if (manifestBytes) {
-      const engine = new EncryptionEngine(crypto, keys);
-      let current: Manifest;
-      try {
-        current = decodeManifest(await engine.decryptManifest(manifestBytes), keys.vaultId);
-      } catch (error: unknown) {
-        if (error instanceof SyncError) throw error;
-        throw SyncError.blocked("ManifestCorrupted", { cause: error });
-      }
-      if (current.movedTo) throw SyncError.blocked("VaultMoved");
-      const updated: Manifest = { ...current, formatVersion: formatVersionFor(current), version: current.version + 1, parentCommit: head.commit, device: deviceId, updatedAt: Date.now() };
-      changes.push({ kind: "putManifest", blob: await engine.encryptManifest(encodeManifest(updated)) });
-    }
-    const commit = await remote.createCommit(head.commit, changes, {
-      message: `Encrypted vault key update\n\nDevice: ${deviceId}\n`,
-    });
-    try {
-      await remote.updateHead(head.commit, commit);
-      return next;
-    } catch (error: unknown) {
-      if (error instanceof SyncError && error.code === "ConcurrentRemoteUpdate") continue;
-      throw error;
-    }
+  const state = store.state;
+  if (!state.vaultId || keys.vaultId !== state.vaultId) throw SyncError.blocked("ForeignVault");
+  if (state.journal || state.pendingCommit) throw new SyncError("InvalidState", "an interrupted synchronisation must finish first");
+  const head = await remote.getHead();
+  if (head.kind !== "ok") throw SyncError.blocked("BranchDeleted");
+  if (head.commit !== state.lastRemoteCommit) throw new SyncError("ConcurrentRemoteUpdate");
+  const bytes = await remote.readConfig(head.commit);
+  if (!bytes) throw SyncError.blocked("ConfigMissing");
+  const current = state.remote;
+  if (current?.movedTo) throw SyncError.blocked("VaultMoved");
+  // The config at our verified head must be the one our manifest was written for.
+  const config = await verifiedConfig(crypto, keys, bytes);
+  if (current) await checkConfigBinding(crypto, current, bytes);
+  const next = await transform(config);
+  const changes: RemoteChange[] = [{ kind: "putConfig", config: next }];
+  let updated: Manifest | null = null;
+  // Always with a manifest bound to its parent – also on top of a bootstrap commit (version 0 → 1), so every
+  // device can follow the authenticated chain across the key update.
+  if (current) {
+    updated = {
+      ...current,
+      formatVersion: MANIFEST_FORMAT_VERSION,
+      version: current.version + 1,
+      parentCommit: head.commit,
+      device: deviceId,
+      updatedAt: Date.now(),
+      configHash: await configHashOf(crypto, next),
+    };
+    const engine = new EncryptionEngine(crypto, keys);
+    const encoded = encodeManifest(updated);
+    decodeManifest(encoded, keys.vaultId);
+    changes.push({ kind: "putManifest", blob: await engine.encryptManifest(encoded) });
   }
-  throw new SyncError("RetriesExhausted");
+  const commit = await remote.createCommit(head.commit, changes, { message: `Encrypted vault key update\n\nDevice: ${deviceId}\n` });
+  await remote.updateHead(head.commit, commit);
+  // The key update is the new head: record it, so the next sync neither re-reads it nor mistakes it.
+  state.lastRemoteCommit = commit;
+  if (updated) {
+    state.remote = updated;
+    state.lastManifestVersion = updated.version;
+  }
+  await store.persist();
+  return next;
 }
 
 export async function changeVaultPassword(options: {
   crypto: CryptoProvider;
   remote: RemoteRepository;
+  store: SyncStateStore;
   keys: VaultKeys;
   deviceId: string;
   newPassword: string;
 }): Promise<PublicVaultConfig> {
-  return updateRemoteConfig(options.crypto, options.remote, options.keys, options.deviceId, (config) =>
+  return updateRemoteConfig(options.crypto, options.remote, options.store, options.keys, options.deviceId, (config) =>
     changePassword(options.crypto, config, options.keys, options.newPassword),
   );
 }
@@ -185,14 +197,15 @@ export async function changeVaultPassword(options: {
 export async function rotateRecoveryKey(options: {
   crypto: CryptoProvider;
   remote: RemoteRepository;
+  store: SyncStateStore;
   keys: VaultKeys;
   deviceId: string;
-}): Promise<string> {
+}): Promise<{ recoveryKey: string; config: PublicVaultConfig }> {
   let recoveryKey = "";
-  await updateRemoteConfig(options.crypto, options.remote, options.keys, options.deviceId, async (config) => {
+  const config = await updateRemoteConfig(options.crypto, options.remote, options.store, options.keys, options.deviceId, async (config) => {
     const result = await regenerateRecoveryKey(options.crypto, config, options.keys);
     recoveryKey = result.recoveryKey;
     return result.config;
   });
-  return recoveryKey;
+  return { recoveryKey, config };
 }

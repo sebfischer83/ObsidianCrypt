@@ -106,6 +106,12 @@ export interface PendingCommit {
   readonly manifest: Manifest;
 }
 
+export interface PendingSwitch {
+  readonly location: RepoLocation;
+  readonly commit: string;
+  readonly manifest: Manifest;
+}
+
 export interface MovedTo extends RepoLocation {
   /** Commit of the old repository that carries the marker. */
   readonly markerCommit: string;
@@ -130,6 +136,11 @@ export interface LocalState {
   conflicts: ConflictRecord[];
   /** Set when the remote announced that the vault moved (see SyncError "VaultMoved"). */
   movedTo: MovedTo | null;
+  /**
+   * A verified head of a new repository this device is switching to (vault moved). Recorded before the
+   * settings change and applied afterwards, so an interruption never leaves state and settings apart.
+   */
+  pendingSwitch: PendingSwitch | null;
 }
 
 export function newLocalState(deviceId: string): LocalState {
@@ -148,6 +159,7 @@ export function newLocalState(deviceId: string): LocalState {
     pendingCommit: null,
     conflicts: [],
     movedTo: null,
+    pendingSwitch: null,
   };
 }
 
@@ -204,6 +216,13 @@ export function parseLocalState(raw: unknown): LocalState {
     pendingCommit,
     conflicts: expectArray(r.conflicts, "state.conflicts").map((c) => parseConflict(c)),
     movedTo: isRecord(r.movedTo) ? { ...parseRepoLocation({ owner: r.movedTo.owner, repo: r.movedTo.repo, branch: r.movedTo.branch }, "state.movedTo"), markerCommit: expectString(r.movedTo.markerCommit, "state.movedTo.markerCommit", GIT_SHA) } : null,
+    pendingSwitch: isRecord(r.pendingSwitch)
+      ? {
+          location: parseRepoLocation(r.pendingSwitch.location, "state.pendingSwitch.location"),
+          commit: expectString(r.pendingSwitch.commit, "state.pendingSwitch.commit", GIT_SHA),
+          manifest: parseManifestObject(r.pendingSwitch.manifest, vaultId ?? ""),
+        }
+      : null,
   };
 }
 

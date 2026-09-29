@@ -3,7 +3,7 @@ import { SyncError } from "../errors/SyncError";
 import type { ConflictRecord } from "../state/LocalState";
 import type { SyncStateStore } from "../state/SyncStateStore";
 import type { LocalFileSystem } from "../vault/LocalFileSystem";
-import { isSyncedContent, trackedObjectId } from "./LocalContent";
+import { isSyncedContent, replaceIfUnchanged, trackedObjectId } from "./LocalContent";
 
 export interface ConflictSides {
   /** Content at the canonical path (the version that won the name), null if the file is gone. */
@@ -37,9 +37,13 @@ export class ConflictResolver {
     return id !== null && isSyncedContent(this.o.store.state, this.o.crypto, this.o.fs, conflict.path, id);
   }
 
-  /** Keeps the canonical version: the copy (if unchanged since compared) moves to the trash. */
-  async keepSynced(conflict: ConflictRecord, expectedCopyHash: string): Promise<void> {
+  /**
+   * Keeps the canonical version: the copy moves to the trash. Both files must still have the content the user
+   * compared – in particular the canonical file must still exist, otherwise neither version would remain.
+   */
+  async keepSynced(conflict: ConflictRecord, expectedCopyHash: string, expectedSyncedHash: string): Promise<void> {
     const copy = this.requireCopyPath(conflict);
+    await this.expectHash(conflict.path, expectedSyncedHash);
     await this.expectHash(copy, expectedCopyHash);
     await this.o.fs.trash(copy);
     await this.dismiss(conflict);
@@ -50,11 +54,14 @@ export class ConflictResolver {
    * Must run under the SyncMutex. Throws SyncError("UnsyncedChanges") if the canonical content is not in
    * the remote history yet.
    */
-  async keepCopy(conflict: ConflictRecord, expectedCopyHash: string): Promise<void> {
+  async keepCopy(conflict: ConflictRecord, expectedCopyHash: string, expectedSyncedHash: string): Promise<void> {
     const copy = this.requireCopyPath(conflict);
     const content = await this.expectHash(copy, expectedCopyHash);
+    await this.expectHash(conflict.path, expectedSyncedHash);
     if (!(await this.canReplaceSynced(conflict))) throw new SyncError("UnsyncedChanges");
-    await this.o.fs.write(conflict.path, content);
+    if (!(await replaceIfUnchanged(this.o.fs, this.o.crypto, conflict.path, expectedSyncedHash, content))) {
+      throw new SyncError("InvalidState", "the file was saved at the same moment; its content was kept – compare again");
+    }
     await this.o.fs.trash(copy);
     await this.dismiss(conflict);
   }

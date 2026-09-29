@@ -129,3 +129,37 @@ describe("sync mutex (§18)", () => {
     expect(mutex.isRunning).toBe(false);
   });
 });
+
+describe("ignore rules are safe against pathological patterns (M1)", () => {
+  it("matches in linear time where a regex would backtrack for minutes", () => {
+    const m = new IgnoreMatcher(["*a*a*a*a*a*a*b", "**/**/**/**/**/x", "[z-a]", "a**b"]);
+    const started = Date.now();
+    expect(m.isIgnored("a".repeat(5000))).toBe(false);
+    expect(m.isIgnored(Array.from({ length: 200 }, () => "d").join("/"))).toBe(false);
+    expect(Date.now() - started).toBeLessThan(1000);
+    expect(m.isIgnored("aaaaaaab")).toBe(true);
+    expect(m.isIgnored("d/d/d/x")).toBe(true);
+    expect(m.isIgnored("z")).toBe(false);
+    // "**" inside a name behaves like "*": it never crosses folders.
+    expect(m.isIgnored("axxb")).toBe(true);
+    expect(m.isIgnored("a/y/b")).toBe(false);
+  });
+
+  it("keeps the documented semantics", () => {
+    const m = new IgnoreMatcher(["*.tmp", "Temp/", "/Inbox.md", "docs/**/draft.md", "!keep.tmp", "cache/**", "[!a]b.md", "\\#hash.md"]);
+    expect(m.isIgnored("x/y/file.tmp")).toBe(true);
+    expect(m.isIgnored("keep.tmp")).toBe(false);
+    expect(m.isIgnored("a/Temp/note.md")).toBe(true);
+    expect(m.isIgnored("Temp")).toBe(false);
+    expect(m.isIgnored("Inbox.md")).toBe(true);
+    expect(m.isIgnored("sub/Inbox.md")).toBe(false);
+    expect(m.isIgnored("docs/draft.md")).toBe(true);
+    expect(m.isIgnored("docs/a/b/draft.md")).toBe(true);
+    expect(m.isIgnored("cache/x.md")).toBe(true);
+    expect(m.isIgnored("cache")).toBe(false);
+    expect(m.isIgnored("cb.md")).toBe(true);
+    expect(m.isIgnored("ab.md")).toBe(false);
+    expect(m.isIgnored("#hash.md")).toBe(true);
+    expect(m.isFolderIgnored("x/Temp")).toBe(false); // negations exist → never skip descending
+  });
+});

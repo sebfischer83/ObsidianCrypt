@@ -61,7 +61,11 @@ const SLOT_ID = /^[a-z0-9-]{1,32}$/;
  * Parses and validates the remote configuration. Throws SyncError(Blocked) for anything that is not a
  * well-formed configuration of a supported format version.
  */
+/** Largest `.vaultsync/config` accepted (a few key slots are a few KiB); checked before parsing. */
+export const MAX_CONFIG_BYTES = 256 * 1024;
+
 export function parseVaultConfig(bytes: Uint8Array): PublicVaultConfig {
+  if (bytes.length > MAX_CONFIG_BYTES) throw SyncError.blocked("ConfigCorrupted");
   let raw: unknown;
   try {
     raw = JSON.parse(utf8Decode(bytes));

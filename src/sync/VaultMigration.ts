@@ -1,12 +1,14 @@
 import type { CryptoProvider } from "../crypto/CryptoProvider";
 import { EncryptionEngine } from "../crypto/EncryptionEngine";
 import type { VaultKeys } from "../crypto/KeyManager";
+import { CryptoError } from "../errors/CryptoError";
+import { GitHubError } from "../errors/GitHubError";
 import { SyncError } from "../errors/SyncError";
 import {
-  formatVersionFor,
+
   isLive,
   MANIFEST_TYPE,
-  MOVE_FORMAT_VERSION,
+  MANIFEST_FORMAT_VERSION,
   type ArchivedRepo,
   type Manifest,
   type ManifestEntry,
@@ -19,7 +21,9 @@ import type { LocalState } from "../state/LocalState";
 import type { SyncStateStore } from "../state/SyncStateStore";
 import { toHex } from "../util/bytes";
 import { DEFAULT_CHUNK_SIZE, encodeObject, readChunkIndex, readObjectContent, withChunks, type ChunkRef } from "./ChunkedContent";
-import { readVerifiedHead, type VerifiedHead } from "./HistoryReader";
+import { configHashOf, readVerifiedHead, type VerifiedHead } from "./HistoryReader";
+import { serializeVaultConfig } from "../manifest/VaultConfig";
+import { bytesEqual } from "../util/bytes";
 import { DEFAULT_LIMITS, HARD_MAX_FILE_SIZE } from "./SyncEngine";
 import { inspectRemote } from "./VaultSetup";
 
@@ -88,12 +92,13 @@ export async function moveVault(o: MoveOptions): Promise<MoveResult> {
   // move can then simply be repeated after a sync and continues where it stopped).
   const marker: Manifest = {
     ...source.manifest,
-    formatVersion: MOVE_FORMAT_VERSION,
+    formatVersion: MANIFEST_FORMAT_VERSION,
     version: source.manifest.version + 1,
     parentCommit: source.commit,
     device: o.deviceId,
     updatedAt: (o.now ?? Date.now)(),
     movedTo: o.targetLocation,
+    configHash: source.configHash,
   };
   const engine = new EncryptionEngine(o.crypto, o.keys);
   const markerCommit = await o.source.createCommit(source.commit, [{ kind: "putManifest", blob: await engine.encryptManifest(checkedManifest(marker)) }], {
@@ -101,15 +106,17 @@ export async function moveVault(o: MoveOptions): Promise<MoveResult> {
   });
   await o.source.updateHead(source.commit, markerCommit);
 
-  rebaseOnto(state, mirrored.head);
+  // The caller switches the settings and then calls completeSwitch (both survive an interruption).
+  recordSwitch(state, o.targetLocation, mirrored.head);
   await o.store.persist();
   return { targetCommit: mirrored.head.commit, markerCommit, copied: mirrored.copied };
 }
 
 /**
- * Switches a device whose repository announced a move (state.movedTo) to the new repository. The merge base
- * stays: the new repository holds the same object ids with the same contents, so the next sync merges
- * exactly as it would have with the old one. Nothing local is touched here.
+ * Prepares switching a device whose repository announced a move (state.movedTo) to the new repository. The
+ * merge base stays: the new repository holds the same object ids with the same contents, so the next sync
+ * merges exactly as it would have with the old one. Nothing local is touched. The caller switches the
+ * settings to `state.pendingSwitch.location` and then calls completeSwitch.
  */
 export async function followMove(o: {
   crypto: CryptoProvider;
@@ -128,20 +135,32 @@ export async function followMove(o: {
   const head = await readVerifiedHead(o.target, o.crypto, o.keys, o.deviceId);
   // The new repository must name the old one as its predecessor (it was created by the move).
   if (!(head.manifest.movedFrom ?? []).some((a) => sameLocation(a, o.sourceLocation))) throw new SyncError("InvalidState", "the new repository does not continue this vault");
-  // Normally newer than anything seen before; equal only if this device already switched to exactly this
-  // head (a move interrupted between updating the state and the settings).
-  const alreadyThere = head.commit === state.lastRemoteCommit && head.manifest.version === state.lastManifestVersion;
-  if (head.manifest.version <= state.lastManifestVersion && !alreadyThere) throw SyncError.blocked("HistoryRewritten");
-  rebaseOnto(state, head);
+  if (head.manifest.version <= state.lastManifestVersion) throw SyncError.blocked("HistoryRewritten");
+  recordSwitch(state, { owner: moved.owner, repo: moved.repo, branch: moved.branch }, head);
   await o.store.persist();
 }
 
-function rebaseOnto(state: LocalState, head: VerifiedHead): void {
-  state.lastRemoteCommit = head.commit;
-  state.remote = head.manifest;
-  state.lastManifestVersion = head.manifest.version;
+function recordSwitch(state: LocalState, location: RepoLocation, head: VerifiedHead): void {
+  state.pendingSwitch = { location, commit: head.commit, manifest: head.manifest };
+}
+
+/**
+ * Applies a recorded switch once the settings point at the new repository. If the new repository has itself
+ * moved on (A → B → C), the next hop is announced right away, so the device never writes into an archive.
+ */
+export function completeSwitch(state: LocalState): void {
+  const pending = state.pendingSwitch;
+  if (!pending) return;
+  state.lastRemoteCommit = pending.commit;
+  state.remote = pending.manifest;
+  state.lastManifestVersion = pending.manifest.version;
   state.pendingCommit = null;
-  state.movedTo = null;
+  state.movedTo = pending.manifest.movedTo ? { ...pending.manifest.movedTo, markerCommit: pending.commit } : null;
+  state.pendingSwitch = null;
+}
+
+export function sameLocation(a: RepoLocation, b: RepoLocation): boolean {
+  return a.owner.toLowerCase() === b.owner.toLowerCase() && a.repo.toLowerCase() === b.repo.toLowerCase() && a.branch === b.branch;
 }
 
 async function mirror(o: MoveOptions, source: VerifiedHead, target: VerifiedHead, movedFrom: ArchivedRepo[]): Promise<{ head: VerifiedHead; copied: number }> {
@@ -168,9 +187,24 @@ async function mirror(o: MoveOptions, source: VerifiedHead, target: VerifiedHead
       else toCopy.push(id);
     }
   }
-  toCopy.sort((a, b) => ((want[a] as { path: string }).path < (want[b] as { path: string }).path ? -1 : 1));
 
   let changes: RemoteChange[] = [];
+  // The new repository carries the source's current config (a resumed move after a password change).
+  // Hash of the config as written into the new repository (bootstrap or putConfig below serialise it).
+  const configHash = await configHashOf(o.crypto, source.config);
+  if (!bytesEqual(serializeVaultConfig(source.config), serializeVaultConfig(target.config))) changes.push({ kind: "putConfig", config: source.config });
+  // A resumed move trusts nothing in the target: objects it claims to have are re-verified before reuse.
+  for (const [id, w] of Object.entries(entries)) {
+    if (!isLive(w)) continue;
+    try {
+      (await readObjectContent(o.target, engine, target.commit, id, w.contentHash, Math.min(w.size, HARD_MAX_FILE_SIZE))).fill(0);
+    } catch (error: unknown) {
+      if (!(error instanceof GitHubError && error.category === "NotFound") && !(error instanceof CryptoError)) throw error;
+      delete entries[id];
+      toCopy.push(id);
+    }
+  }
+  toCopy.sort((a, b) => ((want[a] as { path: string }).path < (want[b] as { path: string }).path ? -1 : 1));
   for (const [id, h] of Object.entries(have)) {
     if (!isLive(h) || isLive(want[id])) continue;
     changes.push({ kind: "deleteObject", objectId: id });
@@ -185,7 +219,7 @@ async function mirror(o: MoveOptions, source: VerifiedHead, target: VerifiedHead
   const commit = async (final: boolean): Promise<void> => {
     const manifest: Manifest = {
       type: MANIFEST_TYPE,
-      formatVersion: formatVersionFor(final ? { movedFrom } : {}),
+      formatVersion: MANIFEST_FORMAT_VERSION,
       vaultId: o.keys.vaultId,
       version: ++version,
       parentCommit: head.commit,
@@ -193,11 +227,12 @@ async function mirror(o: MoveOptions, source: VerifiedHead, target: VerifiedHead
       updatedAt: (o.now ?? Date.now)(),
       entries: { ...entries },
       ...(final ? { movedFrom } : {}),
+      configHash,
     };
     const all: RemoteChange[] = [...changes, { kind: "putManifest", blob: await engine.encryptManifest(checkedManifest(manifest)) }];
     const created = await o.target.createCommit(head.commit, all, { message: buildMigrationMessage(Math.max(1, changes.length), o.deviceId) });
     await o.target.updateHead(head.commit, created);
-    head = { commit: created, config: head.config, manifest };
+    head = { commit: created, config: source.config, configHash, manifest };
     changes = [];
     batchFiles = 0;
     batchBytes = 0;
@@ -207,7 +242,7 @@ async function mirror(o: MoveOptions, source: VerifiedHead, target: VerifiedHead
   for (const id of toCopy) {
     const w = want[id];
     if (!isLive(w)) continue;
-    const content = await readObjectContent(o.source, engine, source.commit, id, w.contentHash, HARD_MAX_FILE_SIZE);
+    const content = await readObjectContent(o.source, engine, source.commit, id, w.contentHash, Math.min(w.size, HARD_MAX_FILE_SIZE));
     const encoded = await encodeObject(chunking, id, content, await oldChunks(id));
     content.fill(0);
     changes.push(...encoded.changes);
@@ -229,6 +264,3 @@ function checkedManifest(manifest: Manifest): Uint8Array {
   return encoded;
 }
 
-function sameLocation(a: RepoLocation, b: RepoLocation): boolean {
-  return a.owner.toLowerCase() === b.owner.toLowerCase() && a.repo.toLowerCase() === b.repo.toLowerCase() && a.branch === b.branch;
-}

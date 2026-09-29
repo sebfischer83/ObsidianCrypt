@@ -1,5 +1,5 @@
 import type { EncryptionEngine } from "../crypto/EncryptionEngine";
-import { envelopeKind, EnvelopeKind } from "../crypto/EncryptionFormat";
+import { ENVELOPE_OVERHEAD, envelopeKind, EnvelopeKind } from "../crypto/EncryptionFormat";
 import { CryptoError } from "../errors/CryptoError";
 import type { LiveEntry } from "../manifest/Manifest";
 import { MAX_CHUNKS } from "../manifest/ManifestCodec";
@@ -17,6 +17,8 @@ import { expectArray, expectInteger, expectLiteral, expectOnlyKeys, expectRecord
 
 export const CHUNK_INDEX_TYPE = "obsidian-encrypted-sync-chunks";
 export const DEFAULT_CHUNK_SIZE = 4 * 1024 * 1024;
+/** Upper bound for an encrypted chunk index (MAX_CHUNKS entries of about 120 bytes). */
+const MAX_INDEX_ENVELOPE_BYTES = 16 * 1024 * 1024;
 
 export interface ChunkRef {
   readonly id: string;
@@ -66,8 +68,11 @@ export async function readObjectContent(
 ): Promise<Uint8Array> {
   const envelope = await remote.readObject(commit, objectId);
   if (envelopeKind(envelope) !== EnvelopeKind.ChunkIndex) {
+    // Size limits are checked before decrypting (a hostile repository could store huge blobs).
+    if (envelope.length > maxSize + ENVELOPE_OVERHEAD) throw new CryptoError("IntegrityMismatch", "object larger than allowed");
     return expectedHash === null ? engine.decryptObjectRevision(objectId, envelope) : engine.decryptObject(objectId, envelope, expectedHash);
   }
+  if (envelope.length > MAX_INDEX_ENVELOPE_BYTES) throw new CryptoError("IntegrityMismatch", "chunk index larger than allowed");
   const chunks = decodeChunkIndex(await engine.decryptChunkIndex(objectId, envelope));
   const total = chunks.reduce((sum, c) => sum + c.size, 0);
   if (total > maxSize) throw new CryptoError("IntegrityMismatch", "chunked object larger than allowed");
@@ -75,7 +80,9 @@ export async function readObjectContent(
   let offset = 0;
   try {
     for (const chunk of chunks) {
-      const data = await engine.decryptObjectRevision(chunk.id, await remote.readObject(commit, chunk.id));
+      const chunkEnvelope = await remote.readObject(commit, chunk.id);
+      if (chunkEnvelope.length !== chunk.size + ENVELOPE_OVERHEAD) throw new CryptoError("IntegrityMismatch", "chunk size");
+      const data = await engine.decryptObjectRevision(chunk.id, chunkEnvelope);
       if (data.length !== chunk.size || (await engine.hash(data)) !== chunk.hash) throw new CryptoError("IntegrityMismatch", "chunk");
       out.set(data, offset);
       offset += data.length;
@@ -92,6 +99,7 @@ export async function readObjectContent(
 export async function readChunkIndex(remote: RemoteRepository, engine: EncryptionEngine, commit: string, objectId: string): Promise<ChunkRef[]> {
   const envelope = await remote.readObject(commit, objectId);
   if (envelopeKind(envelope) !== EnvelopeKind.ChunkIndex) throw new CryptoError("IntegrityMismatch", "expected a chunk index");
+  if (envelope.length > MAX_INDEX_ENVELOPE_BYTES) throw new CryptoError("IntegrityMismatch", "chunk index larger than allowed");
   return decodeChunkIndex(await engine.decryptChunkIndex(objectId, envelope));
 }
 

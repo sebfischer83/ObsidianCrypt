@@ -142,7 +142,7 @@ export function openChangePasswordModal(app: App, minLength: number, change: (cu
   new (class extends Modal {
     override onOpen(): void {
       this.titleEl.setText("Change vault password");
-      this.contentEl.createEl("p", { text: "Only the vault key is re-encrypted; your files are not re-uploaded. Other devices keep working." });
+      this.contentEl.createEl("p", { text: "Only the vault key is re-encrypted; your files are not re-uploaded. Other devices keep working. The old password is not revoked for older commits of the repository history." });
       let current = "";
       let next = "";
       let repeat = "";

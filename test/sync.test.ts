@@ -587,7 +587,7 @@ describe("key management with remote (§26–§28)", () => {
     a.fs.setText("n.md", "v1");
     await a.sync();
     const objectsBefore = remote.headFiles().filter((p) => p.startsWith("objects/"));
-    await changeVaultPassword({ crypto, remote, keys: a.keys, deviceId: a.deviceId, newPassword: "the brand new password" });
+    await changeVaultPassword({ crypto, remote, store: a.store, keys: a.keys, deviceId: a.deviceId, newPassword: "the brand new password" });
     expect(remote.headFiles().filter((p) => p.startsWith("objects/"))).toEqual(objectsBefore);
     await b.sync(); // B keeps its unlocked master key
     expect(b.fs.text("n.md")).toBe("v1");
@@ -633,4 +633,128 @@ describe("performance target (§50)", () => {
     expect(b.fs.readCount - readsB).toBeLessThanOrEqual(5);
     expect(remote.requestCount - requestsBefore).toBeLessThan(20);
   }, 120_000);
+});
+
+describe("security fixes 0.3.1", () => {
+  it("never re-signs a replayed manifest when the password changes (F1)", async () => {
+    const { a, b, remote } = await twoDevices();
+    a.fs.setText("n.md", "v1");
+    await a.sync();
+    a.fs.setText("n.md", "v2");
+    await a.sync();
+    await b.sync();
+    // Attacker without the key appends a commit that replays the previous tree (manifest v1 era).
+    const head = remote.head!;
+    const previous = remote.parentOf(head)!;
+    const replay = "d".repeat(40);
+    remote.commits.set(replay, { ...remote.commits.get(previous)!, sha: replay, parent: head, date: 0 });
+    remote.forceSetHead(replay);
+    const blocked = await a.sync().catch((e: unknown) => e);
+    expect((blocked as SyncError).blockReason).toBe("HistoryRewritten");
+    // The user reacts by changing the password: refused, nothing is published.
+    const refused = await changeVaultPassword({ crypto, remote, store: a.store, keys: a.keys, deviceId: a.deviceId, newPassword: "another long password" }).catch((e: unknown) => e);
+    expect((refused as SyncError).code).toBe("ConcurrentRemoteUpdate");
+    expect(remote.head).toBe(replay);
+    expect(b.fs.text("n.md")).toBe("v2");
+  });
+
+  it("records its own key update and binds the config to the manifest (K2)", async () => {
+    const { a, b, remote } = await twoDevices();
+    a.fs.setText("n.md", "v1");
+    await a.sync();
+    const oldConfig = remote.commits.get(remote.head!)!.files.get(".vaultsync/config")!;
+    await changeVaultPassword({ crypto, remote, store: a.store, keys: a.keys, deviceId: a.deviceId, newPassword: "the brand new password" });
+    expect(a.store.state.lastRemoteCommit).toBe(remote.head);
+    expect(a.store.state.remote!.configHash).toBeDefined();
+    // Swapping the old (validly signed) config back into a sibling commit is detected.
+    const head = remote.head!;
+    const sibling = "c".repeat(40);
+    const files = new Map(remote.commits.get(head)!.files);
+    files.set(".vaultsync/config", oldConfig);
+    remote.commits.set(sibling, { ...remote.commits.get(head)!, sha: sibling, files });
+    remote.forceSetHead(sibling);
+    const error = await b.sync().catch((e: unknown) => e);
+    expect((error as SyncError).blockReason).toBe("ConfigCorrupted");
+  });
+
+  it("refuses an equal version and a sibling branch even if the server claims ancestry (F2)", async () => {
+    const { a, b, remote } = await twoDevices();
+    a.fs.setText("n.md", "base");
+    await a.sync();
+    await b.sync();
+    const fork = remote.head!;
+    // Two devices push on top of the same commit; the server lies that the losing branch descends from ours.
+    b.fs.setText("n.md", "from b");
+    await b.sync();
+    b.fs.setText("n.md", "from b, again");
+    await b.sync(); // b's branch is now ahead in version as well
+    const bHead = remote.head!;
+    remote.forceSetHead(fork);
+    a.fs.setText("n.md", "from a");
+    a.fs.setText("m.md", "only on a");
+    await a.sync();
+    remote.isAncestor = async () => true;
+    remote.forceSetHead(bHead);
+    const error = await a.sync().catch((e: unknown) => e);
+    expect((error as SyncError).blockReason).toBe("HistoryRewritten");
+    expect(a.fs.text("n.md")).toBe("from a");
+    expect(a.fs.text("m.md")).toBe("only on a");
+  });
+});
+
+describe("stale hash cache (L1)", () => {
+  it("turns an unnoticed local edit into a conflict instead of diverging forever", async () => {
+    const { a, b } = await twoDevices();
+    a.fs.setText("n.md", "aaaa");
+    await a.sync();
+    await b.sync();
+    a.fs.setTextKeepingMtime("n.md", "bbbb"); // same size and mtime: the scan trusts the cached hash
+    b.fs.setText("n.md", "cccc");
+    await b.sync();
+    const first = await a.sync();
+    expect(first.failedLocalOps).toBe(1);
+    expect(a.fs.text("n.md")).toBe("bbbb");
+    const second = await a.sync();
+    expect(second.newConflicts).toHaveLength(1);
+    const contents = Object.values(a.fs.snapshot());
+    expect(contents).toContain("bbbb");
+    expect(contents).toContain("cccc");
+    await b.sync();
+    expect(Object.values(b.fs.snapshot())).toContain("bbbb");
+  });
+});
+
+describe("key updates on an empty vault (review of 0.3.1)", () => {
+  it("keeps other devices syncing after a password change on the bootstrap commit", async () => {
+    const { a, b, remote } = await twoDevices();
+    await a.sync();
+    await b.sync();
+    await changeVaultPassword({ crypto, remote, store: a.store, keys: a.keys, deviceId: a.deviceId, newPassword: "the brand new password" });
+    await b.sync();
+    a.fs.setText("first.md", "first note");
+    await a.sync();
+    await b.sync();
+    expect(b.fs.text("first.md")).toBe("first note");
+  });
+
+  it("gives up early instead of walking the whole chain when a pending commit never landed", async () => {
+    const { a, b, remote } = await twoDevices();
+    for (let i = 0; i < 6; i++) {
+      b.fs.setText("n.md", `b${i}`);
+      await b.sync();
+    }
+    await a.sync();
+    a.fs.setText("a.md", "lost race");
+    remote.crashAt = "beforeRefUpdate";
+    await a.sync().catch(() => undefined);
+    b.fs.setText("n.md", "b wins");
+    await b.sync();
+    const reads = remote.requestCount;
+    await a.sync();
+    expect(a.store.state.pendingCommit).toBeNull();
+    expect(remote.requestCount - reads).toBeLessThan(40);
+    expect(a.fs.text("n.md")).toBe("b wins");
+    await b.sync();
+    expect(b.fs.text("a.md")).toBe("lost race");
+  });
 });

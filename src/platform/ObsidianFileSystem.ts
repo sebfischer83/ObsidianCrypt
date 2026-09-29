@@ -82,6 +82,16 @@ export class ObsidianFileSystem implements LocalFileSystem {
     }
   }
 
+  async create(path: string, data: Uint8Array): Promise<void> {
+    const normalized = normalizePath(path);
+    if (this.app.vault.getAbstractFileByPath(normalized) || (await this.adapter.exists(normalized))) throw new Error("Destination exists");
+    await this.ensureFolder(dirname(normalized));
+    const buffer = toArrayBuffer(data);
+    // Vault.createBinary itself refuses existing files; hidden paths are only written by this plugin (under its mutex).
+    if (this.isHidden(normalized)) await this.adapter.writeBinary(normalized, buffer);
+    else await this.app.vault.createBinary(normalized, buffer);
+  }
+
   async rename(from: string, to: string): Promise<void> {
     const src = normalizePath(from);
     const dst = normalizePath(to);

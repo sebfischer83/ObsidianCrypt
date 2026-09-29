@@ -7,7 +7,7 @@ import { isLive } from "../manifest/Manifest";
 import type { ObjectRevision, RemoteRepository } from "../remote/RemoteRepository";
 import type { SyncStateStore } from "../state/SyncStateStore";
 import type { LocalFileSystem } from "../vault/LocalFileSystem";
-import { isSyncedContent, trackedObjectId } from "./LocalContent";
+import { createAtFreeName, isSyncedContent, replaceIfUnchanged, trackedObjectId } from "./LocalContent";
 import { readObjectContent } from "./ChunkedContent";
 import { versionCopyPath } from "./ConflictNaming";
 import { HARD_MAX_FILE_SIZE } from "./SyncEngine";
@@ -117,18 +117,12 @@ export class VersionHistory {
     if (currentHash === (await this.o.crypto.hash(content))) return "unchanged";
     const entry = this.o.store.state.remote?.entries[version.objectId];
     if (!isLive(entry) || entry.contentHash !== currentHash) throw new SyncError("UnsyncedChanges");
-    await this.o.fs.write(path, content);
+    if (!(await replaceIfUnchanged(this.o.fs, this.o.crypto, path, currentHash, content))) throw new SyncError("InvalidState", "the note was saved at the same moment; its content was kept – try again");
     return "restored";
   }
 
   /** Writes a version next to the file as a new file and returns its path. The original stays untouched. */
   async restoreAsCopy(path: string, version: FileVersion, content: Uint8Array): Promise<string> {
-    for (let n = 1; n < 1000; n++) {
-      const candidate = versionCopyPath(path, version.date, n);
-      if (await this.o.fs.exists(candidate)) continue;
-      await this.o.fs.write(candidate, content);
-      return candidate;
-    }
-    throw new SyncError("InvalidState", "no free file name for the restored copy");
+    return createAtFreeName(this.o.fs, content, (n) => versionCopyPath(path, version.date, n + 1));
   }
 }

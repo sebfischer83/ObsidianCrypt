@@ -5,6 +5,9 @@ import type { VaultKeys } from "./KeyManager";
 
 const OBJECT_ID = /^[0-9a-f]{32}$/;
 
+/** Upper bound for an encrypted manifest (roughly 400 000 files). */
+export const MAX_MANIFEST_ENVELOPE_BYTES = 128 * 1024 * 1024;
+
 /**
  * The single gateway between plaintext and the remote layer. Everything uploaded passes through here.
  */
@@ -70,6 +73,8 @@ export class EncryptionEngine {
   }
 
   async decryptManifest(envelope: Uint8Array): Promise<Uint8Array> {
+    // Bounded before any work: a hostile repository must not make a device decrypt and parse gigabytes.
+    if (envelope.length > MAX_MANIFEST_ENVELOPE_BYTES) throw new CryptoError("IntegrityMismatch", "manifest larger than allowed");
     return openEnvelope(this.crypto, this.keys.manifestKey, EnvelopeKind.Manifest, envelope, Contexts.manifest(this.keys.vaultId));
   }
 

@@ -6,18 +6,18 @@
 export const MANIFEST_TYPE = "obsidian-encrypted-sync-manifest";
 
 /**
- * Manifest format written by this version. 2 = objects of large files may be chunk indexes (`chunks`).
- * Older plugin versions stop with "UnknownFormatVersion" instead of misreading such objects.
+ * Manifest format history (older formats are still read):
+ *   1  initial
+ *   2  objects of large files may be chunk indexes (`chunks`)
+ *   3  `movedTo` / `movedFrom` (vault moved to another repository)
+ *   4  `configHash` is mandatory: binds the public config to the manifest (an older, validly signed config
+ *      can no longer be combined with a newer manifest)
+ * Every manifest written by this version uses the newest format.
  */
-export const MANIFEST_FORMAT_VERSION = 2;
-
-/**
- * Format 3 = the manifest carries `movedTo` (the vault moved to another repository) or `movedFrom`
- * (archived earlier repositories). Written only when those fields are present, so vaults that never moved
- * stay readable by format-2 plugin versions.
- */
+export const MANIFEST_FORMAT_VERSION = 4;
 export const MOVE_FORMAT_VERSION = 3;
-export const MAX_MANIFEST_FORMAT_VERSION = MOVE_FORMAT_VERSION;
+export const CONFIG_HASH_FORMAT_VERSION = 4;
+export const MAX_MANIFEST_FORMAT_VERSION = MANIFEST_FORMAT_VERSION;
 
 export interface RepoLocation {
   readonly owner: string;
@@ -28,11 +28,6 @@ export interface RepoLocation {
 /** An earlier repository of this vault, readable up to `commit` (its "moved" marker). */
 export interface ArchivedRepo extends RepoLocation {
   readonly commit: string;
-}
-
-/** Format version a manifest must declare given the fields it uses. */
-export function formatVersionFor(manifest: Pick<Manifest, "movedTo" | "movedFrom">): number {
-  return manifest.movedTo || (manifest.movedFrom && manifest.movedFrom.length > 0) ? MOVE_FORMAT_VERSION : MANIFEST_FORMAT_VERSION;
 }
 
 export interface LiveEntry {
@@ -71,6 +66,8 @@ export interface Manifest {
   readonly movedTo?: RepoLocation;
   /** Earlier repositories of this vault, newest first (format 3). Carried over by every commit. */
   readonly movedFrom?: readonly ArchivedRepo[];
+  /** SHA-256 (hex) of the serialised `.vaultsync/config` of the same commit (mandatory from format 4). */
+  readonly configHash?: string;
 }
 
 export function isLive(entry: ManifestEntry | undefined | null): entry is LiveEntry {
@@ -81,7 +78,8 @@ export function isTombstone(entry: ManifestEntry | undefined | null): entry is T
   return !!entry && "deleted" in entry && entry.deleted === true;
 }
 
-export function emptyManifest(vaultId: string, device: string, formatVersion = MANIFEST_FORMAT_VERSION): Manifest {
+/** Placeholder for a bootstrap commit (no manifest yet). Format 1: it carries no config binding. */
+export function emptyManifest(vaultId: string, device: string, formatVersion = 1): Manifest {
   return {
     type: MANIFEST_TYPE,
     formatVersion,

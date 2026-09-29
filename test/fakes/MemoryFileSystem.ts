@@ -49,6 +49,16 @@ export class MemoryFileSystem implements LocalFileSystem {
     return file.data.slice();
   }
 
+  /** Atomic create-only write (like Vault.createBinary): fails if the file exists at the moment of writing. */
+  async create(path: string, data: Uint8Array): Promise<void> {
+    this.beforeWrite?.(path);
+    if (this.files.has(this.key(path))) throw new Error("EEXIST");
+    if (this.failWrite?.(path)) throw new Error("EIO");
+    this.writeCount++;
+    this.files.set(this.key(path), { path, data: data.slice(), mtime: this.tick() });
+    this.afterWrite?.(path);
+  }
+
   async write(path: string, data: Uint8Array): Promise<void> {
     this.beforeWrite?.(path);
     if (this.failWrite?.(path)) throw new Error("EIO");
@@ -82,6 +92,13 @@ export class MemoryFileSystem implements LocalFileSystem {
   private tick(): number {
     this.clock += 1000;
     return this.clock;
+  }
+
+  /** Changes the content but keeps the modification time (coarse mtime file systems, mtime-preserving tools). */
+  setTextKeepingMtime(path: string, text: string): void {
+    const existing = this.files.get(this.key(path));
+    if (!existing) throw new Error("ENOENT");
+    this.files.set(this.key(path), { ...existing, data: utf8Encode(text) });
   }
 
   setText(path: string, text: string): void {

@@ -27,7 +27,13 @@ objects/<aa>/<id>         encrypted files (AES-256-GCM)
 
 * Random 256-bit vault master key; your password protects it via **Argon2id** (64 MiB, t=3) – PBKDF2-SHA256
   (600 000 iterations, WebCrypto) is available as alternative. Changing the password re-wraps only the key.
-* Optional **recovery key** (shown once, never stored).
+* Optional **recovery key** (shown once, never stored; a new one requires the password).
+* **Changing the password or recovery key does not revoke the old one:** older commits in the repository history
+  still contain the old key slots. Anyone with the old secret and read access to the repository (or a copy) can
+  still decrypt it. Keep the repository private. After a leak, move the vault to a new repository and delete the old
+  one – this helps only as long as nobody has used the old secret yet; a real key rotation is not implemented.
+* Rollback protection: every manifest is bound to its parent commit and to the config, versions must increase,
+  and the history is followed through the encrypted parent links – not by trusting GitHub's answers.
 * Every file and the manifest are encrypted with **AES-256-GCM**, fresh random nonce, AAD binds each object to
   its id and the vault. Manipulated data is rejected, never written into the vault.
 * The GitHub token and (optionally) the vault key are kept in Obsidian's **SecretStorage** (OS keychain),
@@ -108,12 +114,11 @@ Requires Obsidian 1.11.4 or newer. Do not use a second sync tool for the same va
 * If the repository was manipulated (force-push, deleted branch, corrupted manifest, foreign vault, newer
   format) synchronisation stops and your local files are left untouched.
 
-## Upgrading from 0.1.x
+## Versions and formats
 
-This version writes manifest format 2 on its first upload. Devices still running 0.1.x then stop syncing with
-“The repository uses a newer format version. Please update the plugin.” – update the plugin on all devices.
-No data is touched while a device is stopped. Moving a vault to a new repository (0.3.0) writes manifest
-format 3; devices must run 0.3.0 or later to follow the move.
+All devices should run the same plugin version. Every upload writes the newest manifest format (currently 4); a
+device with an older plugin version stops with “The repository uses a newer format version. Please update the
+plugin.” and leaves its files untouched until it is updated.
 
 ## Limits
 

@@ -1,6 +1,7 @@
 import type { CryptoProvider } from "../crypto/CryptoProvider";
 import { utf8Decode, utf8Encode } from "../util/bytes";
 import { isRecord } from "../util/validate";
+import { SyncError } from "../errors/SyncError";
 import { parseLocalState, type LocalState } from "./LocalState";
 
 export interface StateRepository {
@@ -22,6 +23,9 @@ export interface BlobFileStore {
  * secondary. A torn write can therefore only ever damage one of the two copies.
  */
 export class FileStateRepository implements StateRepository {
+  /** An existing state file could not be read: it must never be overwritten with a fresh state. */
+  private unreadable = false;
+
   constructor(
     private readonly store: BlobFileStore,
     private readonly crypto: CryptoProvider,
@@ -30,15 +34,41 @@ export class FileStateRepository implements StateRepository {
     private readonly onCorrupt: (reason: string) => void = () => undefined,
   ) {}
 
+  /**
+   * The first valid copy, or null. Distinguishes "absent" from "present but unusable": unusable copies are
+   * backed up to `<name>.corrupt-<time>` before a fresh state may replace them, and a copy that cannot even
+   * be read (e.g. locked by antivirus or a cloud client) blocks saving until the next start.
+   */
   async load(): Promise<LocalState | null> {
+    const invalid: Array<{ path: string; bytes: Uint8Array }> = [];
     for (const candidate of [this.path, `${this.path}.new`]) {
-      const state = await this.tryLoad(candidate);
-      if (state) return state;
+      const read = await this.readWithRetry(candidate);
+      if (read === "unreadable") {
+        this.unreadable = true;
+        continue;
+      }
+      if (!read) continue;
+      const state = await this.parse(read);
+      if (state) {
+        if (this.unreadable) this.onCorrupt("the primary sync state file could not be read; the backup copy is used and nothing is saved until Obsidian restarts");
+        return state;
+      }
+      invalid.push({ path: candidate, bytes: read });
+    }
+    if (this.unreadable) {
+      this.onCorrupt("the local sync state could not be read; it is kept untouched – restart Obsidian to synchronise again");
+      return null;
+    }
+    if (invalid.length > 0) {
+      const stamp = Date.now();
+      for (const copy of invalid) await this.store.write(`${copy.path}.corrupt-${stamp}`, copy.bytes);
+      this.onCorrupt("the local sync state was invalid and has been set aside; this device reconnects without deleting anything");
     }
     return null;
   }
 
   async save(state: LocalState): Promise<void> {
+    if (this.unreadable) throw new SyncError("InvalidState", "the local sync state file could not be read; restart Obsidian before synchronising");
     const payload = JSON.stringify(state);
     const checksum = await this.crypto.hash(utf8Encode(payload));
     const data = utf8Encode(JSON.stringify({ checksum, payload }));
@@ -46,34 +76,27 @@ export class FileStateRepository implements StateRepository {
     await this.store.write(this.path, data);
   }
 
-  private async tryLoad(path: string): Promise<LocalState | null> {
-    let bytes: Uint8Array | null;
-    try {
-      bytes = await this.store.read(path);
-    } catch (error: unknown) {
-      this.onCorrupt(`state file unreadable (${error instanceof Error ? error.name : "unknown"})`);
-      return null;
+  private async readWithRetry(path: string): Promise<Uint8Array | null | "unreadable"> {
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        return await this.store.read(path);
+      } catch {
+        // transient locks (antivirus, cloud clients): wait briefly and try again
+        await new Promise((resolve) => setTimeout(resolve, 250 * (attempt + 1)));
+      }
     }
-    if (!bytes) return null;
+    return "unreadable";
+  }
+
+  private async parse(bytes: Uint8Array): Promise<LocalState | null> {
     try {
       const wrapper: unknown = JSON.parse(utf8Decode(bytes));
-      if (!isRecord(wrapper) || typeof wrapper.payload !== "string" || typeof wrapper.checksum !== "string") {
-        this.onCorrupt("state wrapper invalid");
-        return null;
-      }
-      if ((await this.crypto.hash(utf8Encode(wrapper.payload))) !== wrapper.checksum) {
-        this.onCorrupt("state checksum mismatch");
-        return null;
-      }
+      if (!isRecord(wrapper) || typeof wrapper.payload !== "string" || typeof wrapper.checksum !== "string") return null;
+      if ((await this.crypto.hash(utf8Encode(wrapper.payload))) !== wrapper.checksum) return null;
       const state = parseLocalState(JSON.parse(wrapper.payload));
-      if (state.deviceId !== this.expectedDeviceId) {
-        // Copied from another device (e.g. by a second sync tool). Using it could corrupt merges.
-        this.onCorrupt("state belongs to another device");
-        return null;
-      }
-      return state;
-    } catch (error: unknown) {
-      this.onCorrupt(`state invalid (${error instanceof Error ? error.name : "unknown"})`);
+      // A state copied from another device (e.g. by a second sync tool) could corrupt merges.
+      return state.deviceId === this.expectedDeviceId ? state : null;
+    } catch {
       return null;
     }
   }

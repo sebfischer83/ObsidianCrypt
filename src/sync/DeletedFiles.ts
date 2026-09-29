@@ -7,6 +7,7 @@ import type { RemoteRepository } from "../remote/RemoteRepository";
 import type { SyncStateStore } from "../state/SyncStateStore";
 import type { LocalFileSystem } from "../vault/LocalFileSystem";
 import { readObjectContent } from "./ChunkedContent";
+import { createAtFreeName } from "./LocalContent";
 import { restoredPath } from "./ConflictNaming";
 import { readManifestAt } from "./HistoryReader";
 import { HARD_MAX_FILE_SIZE } from "./SyncEngine";
@@ -90,18 +91,12 @@ export class DeletedFiles {
   async load(file: ResolvedDeletedFile): Promise<Uint8Array> {
     const source = this.sources(this.o.store.state.lastRemoteCommit ?? "")[file.source];
     if (!source) throw new SyncError("InvalidState", "archive repository no longer known");
-    return readObjectContent(source.remote, this.engine(), file.contentCommit, file.objectId, file.contentHash, HARD_MAX_FILE_SIZE);
+    return readObjectContent(source.remote, this.engine(), file.contentCommit, file.objectId, file.contentHash, Math.min(file.size, HARD_MAX_FILE_SIZE));
   }
 
   /** Writes the content at its old path, or next to it if that path is taken. Returns the path used. */
   async restore(file: ResolvedDeletedFile, content: Uint8Array): Promise<string> {
-    for (let n = 0; n < 1000; n++) {
-      const candidate = n === 0 ? file.path : restoredPath(file.path, n);
-      if (await this.o.fs.exists(candidate)) continue;
-      await this.o.fs.write(candidate, content);
-      return candidate;
-    }
-    throw new SyncError("InvalidState", "no free file name for the restored file");
+    return createAtFreeName(this.o.fs, content, (n) => (n === 0 ? file.path : restoredPath(file.path, n)));
   }
 
   private manifestAt(source: number, remote: RemoteRepository, commit: string): Promise<Manifest> {

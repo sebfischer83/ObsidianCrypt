@@ -17,10 +17,10 @@ export interface ConflictActions {
   dismiss(id: string): Promise<void>;
   load(conflict: ConflictRecord): Promise<ConflictSides>;
   hash(data: Uint8Array): Promise<string>;
-  /** Keep the canonical file, move the copy (unchanged since `copyHash`) to the trash. */
-  keepSynced(conflict: ConflictRecord, copyHash: string): Promise<void>;
+  /** Keep the canonical file, move the copy to the trash (both unchanged since compared). */
+  keepSynced(conflict: ConflictRecord, copyHash: string, syncedHash: string): Promise<void>;
   /** Replace the canonical file with the copy, then move the copy to the trash. */
-  keepCopy(conflict: ConflictRecord, copyHash: string): Promise<void>;
+  keepCopy(conflict: ConflictRecord, copyHash: string, syncedHash: string): Promise<void>;
 }
 
 /** Lists unresolved synchronisation conflicts. Resolving never deletes data permanently. */
@@ -117,6 +117,7 @@ class ConflictCompareModal extends Modal {
     }
     const copy = sides.copy;
     const copyHash = await this.actions.hash(copy);
+    const syncedHash = await this.actions.hash(sides.synced);
     contentEl.createEl("p", {
       cls: "setting-item-description",
       text: `“−” lines are only in the synced version (${this.conflict.path}), “+” lines only in the copy (${copyPath}).`,
@@ -126,14 +127,14 @@ class ConflictCompareModal extends Modal {
     new Setting(contentEl)
       .setName("Keep synced version")
       .setDesc("The copy moves to the vault trash.")
-      .addButton((b) => b.setButtonText("Keep synced").onClick(() => void this.finish(() => this.actions.keepSynced(this.conflict, copyHash), "Kept the synced version; the copy is in the trash.")));
+      .addButton((b) => b.setButtonText("Keep synced").onClick(() => void this.finish(() => this.actions.keepSynced(this.conflict, copyHash, syncedHash), "Kept the synced version; the copy is in the trash.")));
     new Setting(contentEl)
       .setName("Keep copy")
       .setDesc(`The copy's content replaces ${this.conflict.path}; the replaced content stays in the version history and the copy moves to the trash.`)
       .addButton((b) =>
         b.setButtonText("Keep copy").onClick(async () => {
           const ok = await confirmDialog(this.app, "Keep the copy?", [`The content of "${this.conflict.path}" is replaced by the copy.`, "The replaced content remains in the version history."], "Keep copy");
-          if (ok) await this.finish(() => this.actions.keepCopy(this.conflict, copyHash), "Kept the copy.");
+          if (ok) await this.finish(() => this.actions.keepCopy(this.conflict, copyHash, syncedHash), "Kept the copy.");
         }),
       );
     new Setting(contentEl)

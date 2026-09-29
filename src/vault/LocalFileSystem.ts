@@ -32,6 +32,9 @@ export interface LocalFileSystem {
    */
   write(path: string, data: Uint8Array, mtime?: number): Promise<void>;
 
+  /** Creates a new file (creating parent folders). Must fail if anything exists at `path` – never overwrites. */
+  create(path: string, data: Uint8Array): Promise<void>;
+
   /** Renames a file. Must fail if `to` already exists. Must not rewrite links in other notes. */
   rename(from: string, to: string): Promise<void>;
 

@@ -14,21 +14,21 @@ export function splitLines(text: string): string[] {
 }
 
 /**
- * Shortest edit script from `a` to `b`. Returns null if the texts differ in more than `maxEdits` lines
- * (bounds time and memory for unrelated files).
+ * Shortest edit script from `a` to `b`. Returns null if the texts differ in more than `maxEdits` lines, or if
+ * the search would exceed `maxWork` steps (bounds time and memory for large or unrelated files).
  */
-export function diffLines(a: readonly string[], b: readonly string[], maxEdits = 4000): DiffLine[] | null {
+export function diffLines(a: readonly string[], b: readonly string[], maxEdits = 4000, maxWork = 20_000_000): DiffLine[] | null {
   let prefix = 0;
   while (prefix < a.length && prefix < b.length && a[prefix] === b[prefix]) prefix++;
   let suffix = 0;
   while (suffix < a.length - prefix && suffix < b.length - prefix && a[a.length - 1 - suffix] === b[b.length - 1 - suffix]) suffix++;
   const head: DiffLine[] = a.slice(0, prefix).map((text) => ({ type: "equal", text }));
   const tail: DiffLine[] = a.slice(a.length - suffix).map((text) => ({ type: "equal", text }));
-  const middle = myers(a.slice(prefix, a.length - suffix), b.slice(prefix, b.length - suffix), maxEdits);
+  const middle = myers(a.slice(prefix, a.length - suffix), b.slice(prefix, b.length - suffix), maxEdits, maxWork);
   return middle ? [...head, ...middle, ...tail] : null;
 }
 
-function myers(a: readonly string[], b: readonly string[], maxEdits: number): DiffLine[] | null {
+function myers(a: readonly string[], b: readonly string[], maxEdits: number, maxWork: number): DiffLine[] | null {
   const n = a.length;
   const m = b.length;
   const max = n + m;
@@ -37,6 +37,7 @@ function myers(a: readonly string[], b: readonly string[], maxEdits: number): Di
   const v = new Int32Array(2 * max + 3);
   // trace[d] = v[-d+1 .. d-1] at the start of round d (all that backtracking round d reads).
   const trace: Int32Array[] = [];
+  let work = 0;
   for (let d = 0; d <= Math.min(max, maxEdits); d++) {
     trace.push(d === 0 ? new Int32Array(0) : v.slice(offset - d + 1, offset + d));
     for (let k = -d; k <= d; k += 2) {
@@ -45,7 +46,9 @@ function myers(a: readonly string[], b: readonly string[], maxEdits: number): Di
       while (x < n && y < m && a[x] === b[y]) {
         x++;
         y++;
+        work++;
       }
+      if (++work > maxWork) return null;
       v[offset + k] = x;
       if (x >= n && y >= m) return backtrack(a, b, trace, d);
     }

@@ -3,7 +3,7 @@ import { EncryptionEngine } from "../crypto/EncryptionEngine";
 import type { VaultKeys } from "../crypto/KeyManager";
 import { CryptoError } from "../errors/CryptoError";
 import { SyncError } from "../errors/SyncError";
-import { emptyManifest, entriesEquivalent, formatVersionFor, isLive, MANIFEST_TYPE, type LiveEntry, type Manifest, type ManifestEntry } from "../manifest/Manifest";
+import { emptyManifest, entriesEquivalent, isLive, MANIFEST_FORMAT_VERSION, MANIFEST_TYPE, type LiveEntry, type Manifest, type ManifestEntry } from "../manifest/Manifest";
 import { decodeManifest, encodeManifest } from "../manifest/ManifestCodec";
 import { parseVaultConfig, type PublicVaultConfig } from "../manifest/VaultConfig";
 import { buildCommitMessage } from "../remote/RemoteLayout";
@@ -19,6 +19,7 @@ import { scanVault } from "../vault/VaultScanner";
 import { applyLocalOps } from "../vault/VaultWriter";
 import { buildLocalView, type LocalView } from "./ChangeDetector";
 import { planPull, planPush, type PlanContext } from "./SyncPlanner";
+import { checkConfigBinding, configHashOf, descendsFrom, readManifestAt, verifiedConfig } from "./HistoryReader";
 import { DEFAULT_CHUNK_SIZE, encodeObject, readChunkIndex, readObjectContent, withChunks, type ChunkRef } from "./ChunkedContent";
 
 export interface SyncLimits {
@@ -110,6 +111,8 @@ export interface SyncEngineOptions {
   readonly now?: () => number;
   readonly sleep?: (ms: number) => Promise<void>;
   readonly logger?: Logger;
+  /** True once the plugin is unloading: the run stops at the next safe point (journal and state stay valid). */
+  readonly shouldStop?: () => boolean;
 }
 
 type PushOutcome = "nothing" | "done" | "more" | "concurrent";
@@ -124,6 +127,8 @@ export class SyncEngine {
   private readonly log: Logger;
   /** Last validated remote configuration (for UI / password change). */
   lastConfig: PublicVaultConfig | null = null;
+  /** SHA-256 of the config at the head loaded in this run (recorded in every manifest we write). */
+  private headConfigHash: string | null = null;
 
   constructor(private readonly o: SyncEngineOptions) {
     const merged = { ...DEFAULT_LIMITS, ...o.limits };
@@ -158,12 +163,15 @@ export class SyncEngine {
     if (!state.vaultId) throw new SyncError("NotConfigured");
     const keys = this.o.getKeys();
     if (keys.vaultId !== state.vaultId) throw SyncError.blocked("ForeignVault");
+    // A vault move is being applied (settings and state are switched together by the plugin first).
+    if (state.pendingSwitch) throw new SyncError("InvalidState", "switching to the new repository is not finished");
     const engine = new EncryptionEngine(this.o.crypto, keys);
 
     let concurrent = 0;
     for (;;) {
+      this.checkStop();
       const head = await this.fetchHead();
-      await this.recoverPendingCommit(head, report);
+      await this.recoverPendingCommit(head, engine, report);
       await this.recoverJournal(engine, report);
       const remote = await this.loadRemote(head, engine, keys);
       const filter = await this.buildFilter();
@@ -174,6 +182,7 @@ export class SyncEngine {
         return report;
       }
 
+      this.checkStop();
       const outcome = await this.pushPhase(head, remote, engine, filter, report);
       if (outcome === "concurrent") {
         concurrent++;
@@ -241,10 +250,16 @@ export class SyncEngine {
     }
   }
 
-  private async recoverPendingCommit(head: string, report: SyncReport): Promise<void> {
+  private async recoverPendingCommit(head: string, engine: EncryptionEngine, report: SyncReport): Promise<void> {
     const pending = this.state.pendingCommit;
     if (!pending) return;
-    if (pending.commit === head || (await this.o.remote.isAncestor(pending.commit, head))) {
+    let landed = pending.commit === head;
+    if (!landed) {
+      // Others may already have built on top of it: follow the authenticated manifest chain back from head.
+      const headManifest = await this.boundManifestAt(head, engine);
+      landed = headManifest !== null && (await descendsFrom(this.o.remote, engine, head, headManifest, pending.commit, pending.manifest.version));
+    }
+    if (landed) {
       // The branch moved to our commit before we could record it: finalise now.
       this.finalizeCommit(pending.commit, pending.manifest);
       report.recoveredCommit = true;
@@ -263,17 +278,28 @@ export class SyncEngine {
     report.recoveredJournal = true;
   }
 
+  /** Manifest at a commit, checked against the commit's parent; null if the commit carries none. */
+  private async boundManifestAt(commit: string, engine: EncryptionEngine): Promise<Manifest | null> {
+    if (!(await this.o.remote.readManifest(commit))) return null;
+    const manifest = await readManifestAt(this.o.remote, engine, commit);
+    const parents = await this.o.remote.getParents(commit);
+    if (parents.length !== 1 || parents[0] !== manifest.parentCommit) throw SyncError.blocked("HistoryRewritten");
+    return manifest;
+  }
+
   private async loadRemote(head: string, engine: EncryptionEngine, keys: VaultKeys): Promise<Manifest> {
     const state = this.state;
-    if (head === state.lastRemoteCommit && state.remote) return state.remote;
+    if (head === state.lastRemoteCommit && state.remote) {
+      if (state.remote.movedTo) throw SyncError.blocked("VaultMoved");
+      this.headConfigHash = state.remote.configHash ?? (await this.readConfigHash(head, keys));
+      return state.remote;
+    }
     const vaultId = state.vaultId as string;
 
     const configBytes = await this.o.remote.readConfig(head);
     if (!configBytes) throw SyncError.blocked("ConfigMissing");
-    const config = parseVaultConfig(configBytes);
-    if (config.vaultId !== vaultId) throw SyncError.blocked("ForeignVault");
-    if (!(await keys.verifyConfigMac(this.o.crypto, config))) throw SyncError.blocked("ConfigCorrupted");
-    this.lastConfig = config;
+    this.lastConfig = await verifiedConfig(this.o.crypto, keys, configBytes);
+    this.headConfigHash = await configHashOf(this.o.crypto, configBytes);
 
     let manifest: Manifest;
     const manifestBytes = await this.o.remote.readManifest(head);
@@ -295,21 +321,32 @@ export class SyncEngine {
       // repository write access but without the key) fails this check.
       const parents = await this.o.remote.getParents(head);
       if (parents.length !== 1 || parents[0] !== manifest.parentCommit) throw SyncError.blocked("HistoryRewritten");
+      // …and to the config of the same commit (an older, validly signed config cannot be swapped back in).
+      await checkConfigBinding(this.o.crypto, manifest, configBytes);
     }
 
+    const last = state.lastRemoteCommit;
+    if (last !== null) {
+      // Strictly newer, and built on top of what we saw last – checked via the encrypted parent links, not by
+      // asking the server.
+      const continues = manifest.version > state.lastManifestVersion && (await descendsFrom(this.o.remote, engine, head, manifest, last, state.lastManifestVersion));
+      if (!continues) throw SyncError.blocked("HistoryRewritten");
+    }
     if (manifest.movedTo) {
-      // Authenticated (GCM + parent binding above) terminal marker: never write to a retired repository; the
-      // user switches explicitly. Checked before the rollback checks: after an interrupted move this device's
-      // state may already point at the new repository, and the marker must still be recognised.
+      // Authenticated terminal marker (it passed all checks above): never write to a retired repository;
+      // the user switches explicitly.
       state.movedTo = { ...manifest.movedTo, markerCommit: head };
       await this.o.store.persist();
       throw SyncError.blocked("VaultMoved");
     }
-    if (state.lastRemoteCommit !== null) {
-      if (manifest.version < state.lastManifestVersion) throw SyncError.blocked("HistoryRewritten");
-      if (!(await this.o.remote.isAncestor(state.lastRemoteCommit, head))) throw SyncError.blocked("HistoryRewritten");
-    }
     return manifest;
+  }
+
+  private async readConfigHash(head: string, keys: VaultKeys): Promise<string> {
+    const bytes = await this.o.remote.readConfig(head);
+    if (!bytes) throw SyncError.blocked("ConfigMissing");
+    this.lastConfig = await verifiedConfig(this.o.crypto, keys, bytes);
+    return configHashOf(this.o.crypto, bytes);
   }
 
   private async buildFilter(): Promise<SyncFilter> {
@@ -370,7 +407,9 @@ export class SyncEngine {
       localMap: state.localMap,
       hashCache: state.hashCache,
       recovery,
-      fetchContent: (objectId, contentHash) => readObjectContent(this.o.remote, engine, journal.remoteCommit, objectId, contentHash, HARD_MAX_FILE_SIZE),
+      ...(this.o.shouldStop ? { shouldStop: this.o.shouldStop } : {}),
+      // The manifest size bounds the download before anything is decrypted.
+      fetchContent: (objectId, contentHash, size) => readObjectContent(this.o.remote, engine, journal.remoteCommit, objectId, contentHash, Math.min(size, HARD_MAX_FILE_SIZE)),
     });
 
     for (let i = 0; i < journal.ops.length; i++) {
@@ -429,6 +468,8 @@ export class SyncEngine {
     }, ctx);
     report.nameCollisions.push(...plan.nameCollisions);
     if (plan.changeCount === 0) return "nothing";
+    // Defence in depth: never extend a retired repository (loadRemote already blocks on the marker).
+    if (remote.movedTo) throw SyncError.blocked("VaultMoved");
 
     const entries = plan.entries;
     const changes: RemoteChange[] = [];
@@ -475,7 +516,7 @@ export class SyncEngine {
 
     const manifest: Manifest = {
       type: MANIFEST_TYPE,
-      formatVersion: formatVersionFor(remote),
+      formatVersion: MANIFEST_FORMAT_VERSION,
       vaultId: state.vaultId as string,
       version: remote.version + 1,
       parentCommit: head,
@@ -483,6 +524,7 @@ export class SyncEngine {
       updatedAt: this.now(),
       entries,
       ...(remote.movedFrom ? { movedFrom: remote.movedFrom } : {}),
+      configHash: this.requireConfigHash(),
     };
     const encoded = encodeManifest(manifest);
     // Self-check: never publish a manifest our own strict parser would reject.
@@ -515,6 +557,15 @@ export class SyncEngine {
     report.remoteDeletes += plan.deletes.length;
     this.log.info("pushed commit", { changes: pushed.length, deletes: plan.deletes.length });
     return plan.morePending ? "more" : "done";
+  }
+
+  private checkStop(): void {
+    if (this.o.shouldStop?.()) throw new SyncError("InvalidState", "synchronisation stopped");
+  }
+
+  private requireConfigHash(): string {
+    if (this.headConfigHash === null) throw new SyncError("InvalidState", "config of the remote head unknown");
+    return this.headConfigHash;
   }
 
   /** Chunks of the object's version at `head` (to reuse unchanged ones and remove obsolete ones), or null. */

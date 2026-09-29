@@ -4,12 +4,16 @@ import { objectPath } from "../src/remote/RemoteLayout";
 import { ActivityLog } from "../src/state/ActivityLog";
 import type { BlobFileStore } from "../src/state/StateRepository";
 import { ConflictResolver } from "../src/sync/ConflictResolver";
+import { createAtFreeName } from "../src/sync/LocalContent";
 import { DeletedFiles } from "../src/sync/DeletedFiles";
 import { explorerMarks } from "../src/sync/FileStatus";
 import { RepositoryVerifier } from "../src/sync/RepositoryVerifier";
 import { decodeText, diffLines, splitLines, type DiffLine } from "../src/util/diff";
 import { utf8Decode, utf8Encode } from "../src/util/bytes";
-import { crypto, Device, twoDevices } from "./fakes/harness";
+import { crypto, DEFAULT_FILTER, Device, twoDevices } from "./fakes/harness";
+import { FileStateRepository } from "../src/state/StateRepository";
+import { newLocalState } from "../src/state/LocalState";
+import { SyncEngine } from "../src/sync/SyncEngine";
 
 function deletedFiles(d: Device): DeletedFiles {
   return new DeletedFiles({ crypto, fs: d.fs, remote: d.remote, store: d.store, getKeys: () => d.keys });
@@ -204,7 +208,7 @@ describe("conflict resolution", () => {
     const sides = await resolver.load(conflict);
     expect(utf8Decode(sides.synced!)).toBe("from A");
     expect(utf8Decode(sides.copy!)).toBe("from B");
-    await resolver.keepSynced(conflict, await crypto.hash(sides.copy!));
+    await resolver.keepSynced(conflict, await crypto.hash(sides.copy!), await crypto.hash(sides.synced!));
     expect(await b.fs.exists(conflict.conflictPath!)).toBe(false);
     expect(b.fs.trashed.map((t) => utf8Decode(t.data))).toContain("from B");
     expect(b.store.state.conflicts).toEqual([]);
@@ -214,7 +218,7 @@ describe("conflict resolution", () => {
     const { a, b, conflict, resolver } = await contentConflict();
     const sides = await resolver.load(conflict);
     expect(await resolver.canReplaceSynced(conflict)).toBe(true);
-    await resolver.keepCopy(conflict, await crypto.hash(sides.copy!));
+    await resolver.keepCopy(conflict, await crypto.hash(sides.copy!), await crypto.hash(sides.synced!));
     expect(b.fs.text("Note.md")).toBe("from B");
     expect(await b.fs.exists(conflict.conflictPath!)).toBe(false);
     await b.sync();
@@ -227,16 +231,40 @@ describe("conflict resolution", () => {
     const { b, conflict, resolver } = await contentConflict();
     const sides = await resolver.load(conflict);
     const hash = await crypto.hash(sides.copy!);
+    const synced = await crypto.hash(sides.synced!);
     b.fs.setText(conflict.conflictPath!, "edited copy");
-    await expect(resolver.keepSynced(conflict, hash)).rejects.toBeInstanceOf(SyncError);
-    await expect(resolver.keepCopy(conflict, hash)).rejects.toBeInstanceOf(SyncError);
+    await expect(resolver.keepSynced(conflict, hash, synced)).rejects.toBeInstanceOf(SyncError);
+    await expect(resolver.keepCopy(conflict, hash, synced)).rejects.toBeInstanceOf(SyncError);
     expect(b.fs.text(conflict.conflictPath!)).toBe("edited copy");
 
     b.fs.setText("Note.md", "unsynced edit");
-    const error = await resolver.keepCopy(conflict, await crypto.hash(utf8Encode("edited copy"))).catch((e: unknown) => e);
+    const unsynced = await crypto.hash(utf8Encode("unsynced edit"));
+    const error = await resolver.keepCopy(conflict, await crypto.hash(utf8Encode("edited copy")), unsynced).catch((e: unknown) => e);
     expect((error as SyncError).code).toBe("UnsyncedChanges");
     expect(b.fs.text("Note.md")).toBe("unsynced edit");
     expect(b.store.state.conflicts).toHaveLength(1);
+  });
+
+  it("never trashes the copy when the synced file is gone (L4)", async () => {
+    const { b, conflict, resolver } = await contentConflict();
+    const sides = await resolver.load(conflict);
+    await b.fs.trash("Note.md");
+    await expect(resolver.keepSynced(conflict, await crypto.hash(sides.copy!), await crypto.hash(sides.synced!))).rejects.toBeInstanceOf(SyncError);
+    expect(await b.fs.exists(conflict.conflictPath!)).toBe(true);
+  });
+
+  it("restores into a free name even if the name is taken concurrently (L2)", async () => {
+    const { b } = await contentConflict();
+    let raced = false;
+    b.fs.beforeWrite = (path) => {
+      if (!raced && path === "Late.md") {
+        raced = true;
+        void b.fs.write("Late.md", utf8Encode("appeared concurrently"));
+      }
+    };
+    const chosen = await createAtFreeName(b.fs, utf8Encode("restored"), (n) => (n === 0 ? "Late.md" : `Late ${n}.md`));
+    expect(b.fs.text("Late.md")).toBe("appeared concurrently");
+    expect(b.fs.text(chosen)).toBe("restored");
   });
 });
 
@@ -322,5 +350,75 @@ describe("file status for the explorer", () => {
       "unknown.md": "ignored",
       "Note (conflict 2026-09-28 abc).md": "conflict",
     });
+  });
+});
+
+describe("local state robustness (L6)", () => {
+  class FlakyStore extends MemoryBlobStore {
+    failReads = 0;
+    override async read(path: string): Promise<Uint8Array | null> {
+      if (this.failReads > 0) {
+        this.failReads--;
+        throw new Error("EBUSY");
+      }
+      return super.read(path);
+    }
+  }
+  const DEVICE = "12345678-0000-4000-8000-000000000000";
+
+  it("sets an invalid state aside instead of overwriting it", async () => {
+    const store = new FlakyStore();
+    store.files.set("state.json", utf8Encode("{garbage"));
+    const reasons: string[] = [];
+    const repo = new FileStateRepository(store, crypto, "state.json", DEVICE, (r) => reasons.push(r));
+    expect(await repo.load()).toBeNull();
+    const backups = [...store.files.keys()].filter((k) => k.startsWith("state.json.corrupt-"));
+    expect(backups).toHaveLength(1);
+    expect(utf8Decode(store.files.get(backups[0]!)!)).toBe("{garbage");
+    expect(reasons).toHaveLength(1);
+    await repo.save(newLocalState(DEVICE));
+    expect(await repo.load()).not.toBeNull();
+  });
+
+  it("retries transient read errors and never overwrites an unreadable state", async () => {
+    const store = new FlakyStore();
+    const good = new FileStateRepository(store, crypto, "state.json", DEVICE);
+    await good.save(newLocalState(DEVICE));
+    store.failReads = 2;
+    expect(await new FileStateRepository(store, crypto, "state.json", DEVICE).load()).not.toBeNull();
+
+    store.failReads = 100;
+    const blocked = new FileStateRepository(store, crypto, "state.json", DEVICE);
+    expect(await blocked.load()).toBeNull();
+    const before = store.files.get("state.json")!.slice();
+    await expect(blocked.save(newLocalState(DEVICE))).rejects.toBeInstanceOf(SyncError);
+    expect(store.files.get("state.json")).toEqual(before);
+  });
+});
+
+describe("stopping a sync (L5) and bounded diffs", () => {
+  it("stops at the next safe point and resumes later without loss", async () => {
+    const { a, b } = await twoDevices();
+    for (let i = 0; i < 5; i++) a.fs.setText(`n${i}.md`, `note ${i}`);
+    await a.sync();
+    let stop = false;
+    let writes = 0;
+    b.fs.afterWrite = () => {
+      if (++writes === 2) stop = true;
+    };
+    const engine = new SyncEngine({ crypto, fs: b.fs, remote: b.remote, store: b.store, getKeys: () => b.keys, filterSettings: DEFAULT_FILTER, deviceId: b.deviceId, sleep: async () => undefined, shouldStop: () => stop });
+    await expect(engine.sync()).rejects.toBeInstanceOf(SyncError);
+    expect(b.store.state.journal).not.toBeNull();
+    b.fs.afterWrite = null;
+    await b.restart();
+    await b.sync();
+    expect(Object.keys(b.fs.snapshot()).filter((p) => p.endsWith(".md"))).toHaveLength(5);
+  });
+
+  it("gives up on diffs that would take too long", () => {
+    const a = Array.from({ length: 3000 }, (_, i) => `a${i}`);
+    const b = Array.from({ length: 3000 }, (_, i) => `b${i}`);
+    expect(diffLines(a, b, 100_000, 100_000)).toBeNull();
+    expect(diffLines(["x", ...a], ["y", ...a])).not.toBeNull();
   });
 });

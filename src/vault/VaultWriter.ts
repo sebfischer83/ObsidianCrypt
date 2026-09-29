@@ -1,4 +1,5 @@
 import type { CryptoProvider } from "../crypto/CryptoProvider";
+import { CryptoError } from "../errors/CryptoError";
 import { GitHubError } from "../errors/GitHubError";
 import { SyncError } from "../errors/SyncError";
 import { VaultSyncError } from "../errors/VaultSyncError";
@@ -13,13 +14,15 @@ export interface ApplyContext {
   readonly localMap: Record<string, string>;
   readonly hashCache: Record<string, HashCacheEntry>;
   /** Downloads, decrypts and verifies the content (GCM + manifest hash). Throws on any failure. */
-  readonly fetchContent: (objectId: string, contentHash: string) => Promise<Uint8Array>;
+  readonly fetchContent: (objectId: string, contentHash: string, size: number) => Promise<Uint8Array>;
   /**
    * Recovery mode (re-running a journal after a crash): an op whose post-condition already holds counts as
    * done even if its pre-condition no longer does.
    */
   readonly recovery: boolean;
   readonly onProgress?: (done: number, total: number) => void;
+  /** Checked before every op: true aborts the apply (the journal is resumed on the next run). */
+  readonly shouldStop?: () => boolean;
 }
 
 export interface OpFailure {
@@ -58,6 +61,7 @@ export async function applyLocalOps(ops: readonly LocalOp[], ctx: ApplyContext):
   };
 
   for (let i = 0; i < ops.length; i++) {
+    if (ctx.shouldStop?.()) throw new SyncError("InvalidState", "synchronisation stopped");
     const op = ops[i] as LocalOp;
     if (op.requires.some((r) => failed.has(r))) {
       markFailed(i, op, "dependency");
@@ -70,6 +74,8 @@ export async function applyLocalOps(ops: readonly LocalOp[], ctx: ApplyContext):
     } catch (error: unknown) {
       // Network/auth/rate-limit problems abort the whole apply; the journal is resumed on the next run.
       if (error instanceof GitHubError && error.category !== "NotFound") throw error;
+      // The vault was locked (plugin unloading or user action): stop, the journal resumes later.
+      if (error instanceof CryptoError && error.code === "Locked") throw error;
       if (error instanceof VaultSyncError) markFailed(i, op, "error", error);
       else markFailed(i, op, "error", new SyncError("LocalWriteFailed", undefined, { cause: error }));
     }
@@ -143,7 +149,7 @@ async function applyOne(op: LocalOp, ctx: ApplyContext): Promise<boolean> {
         delete ctx.hashCache[op.path];
         return true; // already gone
       }
-      if (hash !== op.expectedHash) return false;
+      if (hash !== op.expectedHash) return diverged(ctx, op.path);
       await ctx.fs.trash(op.path);
       delete ctx.localMap[op.path];
       delete ctx.hashCache[op.path];
@@ -151,7 +157,7 @@ async function applyOne(op: LocalOp, ctx: ApplyContext): Promise<boolean> {
     }
     case "adopt": {
       const hash = await currentHash(ctx, op.path);
-      if (hash !== op.expectedHash) return false;
+      if (hash !== op.expectedHash) return diverged(ctx, op.path);
       ctx.localMap[op.path] = op.objectId;
       return true;
     }
@@ -171,12 +177,12 @@ async function applyOne(op: LocalOp, ctx: ApplyContext): Promise<boolean> {
         cacheVerified(ctx, op.path, current);
         return true;
       }
-      if (hash === null ? op.expectedCurrentHash !== null : hash !== op.expectedCurrentHash) return false;
+      if (hash === null ? op.expectedCurrentHash !== null : hash !== op.expectedCurrentHash) return diverged(ctx, op.path);
       // Fully decrypted + authenticated + hash-verified before anything is written.
-      const data = await ctx.fetchContent(op.objectId, op.contentHash);
+      const data = await ctx.fetchContent(op.objectId, op.contentHash, op.size);
       // Re-check right before writing to keep the race window with the editor minimal.
       const again = await currentHash(ctx, op.path);
-      if (again !== hash) return false;
+      if (again !== hash) return diverged(ctx, op.path);
       await ctx.fs.write(op.path, data);
       ctx.localMap[op.path] = op.objectId;
       const written = await currentState(ctx, op.path);
@@ -191,4 +197,15 @@ async function applyOne(op: LocalOp, ctx: ApplyContext): Promise<boolean> {
       return true;
     }
   }
+}
+
+/**
+ * A precondition failed: the file is not what the plan expected. The plan may have been built from a stale
+ * hash-cache entry (content changed while size and mtime stayed, e.g. 2-second mtime granularity), so the
+ * entry is dropped – the next scan re-hashes the file and the merge sees the real local change instead of
+ * diverging forever.
+ */
+function diverged(ctx: ApplyContext, path: string): false {
+  delete ctx.hashCache[path];
+  return false;
 }

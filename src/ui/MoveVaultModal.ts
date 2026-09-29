@@ -4,7 +4,7 @@ import type EncryptedSyncPlugin from "../main";
 import type { RepoLocation } from "../manifest/Manifest";
 import { confirmDialog, formatBytes } from "./Modals";
 
-type TargetState = Awaited<ReturnType<EncryptedSyncPlugin["inspectMoveTarget"]>>;
+type TargetState = Awaited<ReturnType<EncryptedSyncPlugin["inspectMoveTarget"]>>["state"];
 
 const TARGET_TEXT: Record<TargetState, string> = {
   missing: "The repository does not exist (or the token cannot see it).",
@@ -18,6 +18,7 @@ const TARGET_TEXT: Record<TargetState, string> = {
 export class MoveVaultModal extends Modal {
   private target: RepoLocation;
   private state: TargetState | null = null;
+  private isPrivate = false;
   private statusEl: HTMLElement | null = null;
   private moveButton: ButtonComponent | null = null;
   private createButton: ButtonComponent | null = null;
@@ -83,8 +84,11 @@ export class MoveVaultModal extends Modal {
   private async check(): Promise<void> {
     this.statusEl?.setText("Checking…");
     try {
-      this.state = await this.plugin.inspectMoveTarget(this.target);
-      this.statusEl?.setText(TARGET_TEXT[this.state]);
+      const result = await this.plugin.inspectMoveTarget(this.target);
+      this.state = result.state;
+      this.isPrivate = result.isPrivate;
+      const visibility = result.state === "missing" ? "" : result.isPrivate ? " (private)" : " ⚠ This repository is PUBLIC: everyone can see its encrypted data and metadata (file count, sizes, change times).";
+      this.statusEl?.setText(TARGET_TEXT[this.state] + visibility);
       this.moveButton?.setDisabled(this.state !== "empty" && this.state !== "resumable");
       this.createButton?.setDisabled(this.state !== "missing");
     } catch (error: unknown) {
@@ -112,6 +116,16 @@ export class MoveVaultModal extends Modal {
       "Move vault",
     );
     if (!ok) return;
+    if (!this.isPrivate) {
+      const confirmed = await confirmDialog(
+        this.app,
+        "Use a PUBLIC repository?",
+        ["The contents stay encrypted, but everyone can download them and see metadata such as the number of files, their approximate sizes and when they change.", "A private repository is strongly recommended."],
+        "Use public repository",
+        true,
+      );
+      if (!confirmed) return;
+    }
     const { contentEl } = this;
     contentEl.empty();
     const progress = contentEl.createEl("progress", { cls: "encrypted-sync-progress" });

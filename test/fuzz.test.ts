@@ -7,6 +7,7 @@ import { crypto, twoDevices, type Device } from "./fakes/harness";
 import { CrashError, FakeRemoteRepository } from "./fakes/FakeRemoteRepository";
 import { SyncError } from "../src/errors/SyncError";
 import { followMove, moveVault } from "../src/sync/VaultMigration";
+import { changeVaultPassword } from "../src/sync/VaultSetup";
 import { GitHubError } from "../src/errors/GitHubError";
 
 /** Every plaintext ever committed (recoverable from the git history), chunked files reassembled. */
@@ -118,7 +119,11 @@ describe(`randomised two-device sessions (no data loss, convergence)${variant.la
         for (const c of Object.values(a.fs.snapshot())) everWritten.add(c);
         for (const c of Object.values(b.fs.snapshot())) everWritten.add(c);
         const order = rnd() < 0.5 ? [a, b] : [b, a];
-        for (const d of order) await syncChecked(d, remote);
+        for (const d of order) {
+          await syncChecked(d, remote);
+          // Occasionally a key update (password / recovery key) right after a sync, as the plugin does it.
+          if (rnd() < 0.15) await changeVaultPassword({ crypto, remote, store: d.store, keys: d.keys, deviceId: d.deviceId, newPassword: `password number ${counter.n++} long enough` });
+        }
       }
       // Quiesce: after a few rounds without edits both devices are identical.
       for (let i = 0; i < 2; i++) {

@@ -1,6 +1,6 @@
 # Encrypted GitHub Sync – Design
 
-Status: Manifest-formatVersion 2 (große Dateien als Chunks, §2.5), 3 nur für umgezogene Vaults (§7c); Config-formatVersion 1. Dieses Dokument deckt die Punkte 1–7 aus Abschnitt 65 des
+Status: Manifest-formatVersion 4 (Chunks §2.5, Umzug §7c, Config-Bindung §3); ältere Formate werden gelesen. Config-formatVersion 1. Security-Review und Fixes: §12. Dieses Dokument deckt die Punkte 1–7 aus Abschnitt 65 des
 Anforderungsprofils ab. Leitprinzip: **Ein Synchronisationsfehler darf unbequem sein. Ein Datenverlust
 oder Klartext-Leak darf nicht passieren.**
 
@@ -84,7 +84,7 @@ Keine weiteren Dateien. Commit-Messages: `Encrypted vault sync: <n> changes` mit
 | 20     | n     | Ciphertext                                         |
 | 20+n   | 16    | GCM Authentication Tag                             |
 
-AAD = `header[0..20) ‖ UTF-8(context)`. Der Kontext wird beim Entschlüsseln rekonstruiert und
+AAD = `header[0..8) ‖ UTF-8(context)` (Magic, Version, Algorithmus, Kind, reserviert; die Nonce authentisiert GCM selbst). Der Kontext wird beim Entschlüsseln rekonstruiert und
 nicht gespeichert:
 
 * Objekt: `ovs/v1/object/<vaultId>/<objectId>` → verhindert das Vertauschen von Objekten.
@@ -111,7 +111,7 @@ liefert immer die binären Envelope-Bytes. Armoring ist reine Transportcodierung
 ```json
 {
   "type": "obsidian-encrypted-sync",
-  "formatVersion": 2,
+  "formatVersion": 1,
   "vaultId": "9f2c…(32 hex)",
   "encryption": { "algorithm": "AES-256-GCM", "version": 1 },
   "keyDerivation": { "algorithm": "HKDF-SHA256", "version": 1 },
@@ -157,7 +157,7 @@ Versionsverlauf funktioniert unverändert, weil sich `objects/<aa>/<id>` (der In
 ```json
 {
   "type": "obsidian-encrypted-sync-manifest",
-  "formatVersion": 2,
+  "formatVersion": 4,
   "vaultId": "…",
   "version": 18,
   "parentCommit": "<sha des Parent-Commits oder null>",
@@ -182,6 +182,9 @@ Versionsverlauf funktioniert unverändert, weil sich `objects/<aa>/<id>` (der In
   Ein ungültiges Manifest wird verworfen → Sync stoppt.
 * Content-Hashes stehen nur im verschlüsselten Manifest.
 * `chunks` (optional, ab formatVersion 2): Objekt ist ein Chunk-Index mit so vielen Chunks (§2.5).
+* `configHash` (Pflicht ab formatVersion 4): SHA-256 der `.vaultsync/config` desselben Commits. Eine ältere, gültig
+  signierte Config lässt sich damit nicht mehr neben ein neueres Manifest legen (Config und Manifest sind gebunden).
+* `movedTo` / `movedFrom` (ab formatVersion 3): Umzug, §7c. Jedes neue Manifest wird im neuesten Format geschrieben.
 
 ---
 
@@ -213,19 +216,24 @@ Recovery-Key (256 bit) ──HKDF-SHA256(salt)──► KEK_rk ──AES-GCM unw
   (Downgrade-Schutz).
 * **Nonces:** 96 bit zufällig je Verschlüsselung. Bei ≤ 2³² Verschlüsselungen pro Schlüssel ist die
   Kollisionswahrscheinlichkeit < 2⁻³²; Object- und Manifest-Key sind getrennt.
-* **Recovery-Key:** 256 bit zufällig, angezeigt als Crockford-Base32 in 4er-Gruppen mit Prüfsumme
-  (`VSRK-XXXX-…`). Hohe Entropie → HKDF statt langsamer KDF. Wird nur einmal angezeigt, nie gespeichert.
+* **Recovery-Key:** 256 bit zufällig plus 16-bit-Prüfsumme (SHA-256, nur Tippfehler-Erkennung), angezeigt als
+  Crockford-Base32 in 5er-Gruppen (55 Zeichen). Hohe Entropie → HKDF statt langsamer KDF. Wird nur einmal angezeigt,
+  nie gespeichert. Ein neuer Recovery-Key verlangt das aktuelle Passwort.
 * **Passwortänderung:** alten Slot entschlüsseln (bzw. MK aus entsperrter Sitzung), neues Salt, neuer
   KEK, gleicher MK neu gewrappt, neuer Config-Commit (über Mutex + CAS). Objekte bleiben unverändert.
-  Hinweis: Geräte, die den MK bereits kennen, behalten Zugriff (keine Revocation in V1 – dafür wäre
-  eine MK-Rotation mit Neuverschlüsselung aller Objekte nötig, als spätere Migration vorgesehen).
+  **Kein Widerruf:** Geräte, die den MK kennen, behalten Zugriff, **und alte Configs in der Git-Historie enthalten die
+  alten Slots** – altes Passwort bzw. alter Recovery-Key plus Lesezugriff auf das Repo (oder eine Kopie) liefern
+  weiterhin den MK. Die UI sagt das beim Ändern. Echter Widerruf braucht eine MK-Rotation mit Neuverschlüsselung
+  (offen, §12). Config-Änderungen laufen nur direkt nach einem Sync und bauen das neue Manifest aus dem lokal
+  verifizierten Stand (nie aus dem, was das Remote gerade liefert).
 * **Config-MAC:** schützt vaultId, Slot-Liste und Versionen gegen unbemerkte Manipulation und erkennt
   "Repository gehört zu anderem Vault" (MAC schlägt mit lokalem MK fehl).
 * **Speicherung lokal:** GitHub-Token und (optional, "auf diesem Gerät merken") der MK liegen
   ausschließlich in `app.secretStorage` (OS-Keychain). Nie in `data.json`, nie in Logs/Fehlermeldungen.
   Ohne SecretStorage: nur im Arbeitsspeicher.
 * **Lock:** MK aus dem Speicher entfernen (Bytes überschreiben, best effort) **und** aus SecretStorage
-  löschen. Nächster Sync verlangt Passwort.
+  löschen; danach wird geprüft, dass er weg ist – sonst wird „merken“ abgeschaltet und gewarnt. Beim Wechsel zu
+  einem anderen Vault wird der Schlüssel des vorherigen gelöscht.
 * Verlust von Passwort **und** Recovery-Key = Daten unwiederbringlich verloren. Keine Backdoor.
 
 ---
@@ -249,11 +257,13 @@ Ablauf eines Syncs (`SyncEngine.sync`), unter `SyncMutex` (weitere Anfragen setz
 
 ```
  0 RECOVER     journal vorhanden? → idempotent fertigstellen (Vor-/Nachbedingung je Op per Hash)
-               pendingCommit vorhanden? → HEAD == commit oder Vorfahre von HEAD → finalisieren, sonst verwerfen
+               pendingCommit vorhanden? → HEAD == commit oder über die Manifest-Kette erreichbar → finalisieren, sonst verwerfen
  1 FETCH HEAD  Branch fehlt (obwohl bekannt) → STOP; Repo fehlt → STOP
- 2 FETCH REMOTE falls HEAD ≠ lastRemoteCommit: config (+MAC, vaultId, formatVersion), manifest
-               entschlüsseln+validieren; version < lastManifestVersion oder lastRemoteCommit kein
-               Vorfahre von HEAD → STOP (History manipuliert)
+ 2 FETCH REMOTE falls HEAD ≠ lastRemoteCommit: config (Größe, MAC, vaultId, formatVersion), manifest
+               (Größe, entschlüsseln, validieren, Parent-Bindung, configHash == Hash der Config). Dann muss
+               version > lastManifestVersion sein **und** lastRemoteCommit über die verschlüsselten
+               parentCommit-Links erreichbar (Version −1 je Schritt; erst nach 25 Schritten Fallback auf die
+               compare-API) → sonst STOP (History manipuliert). Umzugs-Marker erst danach → STOP (VaultMoved)
  3 SCAN        lokale Dateien (Ignore-Regeln, Limits), Hash nur bei geänderter size/mtime
  4 PLAN        3-Wege-Merge (base, local, remote) → lokale Ops + Konflikte
  5 APPLY       benötigte Objekte laden → entschlüsseln → Hash prüfen (alles im Speicher);
@@ -323,13 +333,18 @@ werden nie als lokale Löschung interpretiert; ihre Remote-Einträge bleiben unv
 | 17 | Datei lokal vorhanden, aber gerade nicht verwaltet (zu groß, unlesbar, veralteter Index) | Merge-Basis dieser ID bleibt stehen (`heldBack`), bis die Datei wieder verwaltet wird – sonst würde der alte lokale Inhalt später eine Remote-Änderung überschreiben. |
 | 18 | Lokal gelöscht, remote in nicht verwaltbare Form geändert (zu groß / ausgeschlossener Pfad) | Konflikt, Löschung wird verworfen (`untrack`), nie Tombstone. |
 | 19 | Editor schreibt direkt nach dem Download | Kein zweiter Schreibversuch; ID bleibt divergiert → nächster Merge bewahrt beide Versionen. Hash-Cache nur bei stabilem Stat. |
-| 20 | Angreifer mit Schreibzugriff hängt altes Manifest an (Replay) | Jeder Manifest-Commit muss direkter Kind-Commit von `manifest.parentCommit` sein; Config-Commits schreiben ebenfalls ein neues Manifest. |
+| 20 | Angreifer mit Schreibzugriff hängt altes Manifest an (Replay) | Jeder Manifest-Commit muss direkter Kind-Commit von `manifest.parentCommit` sein; die Version muss steigen und `lastRemoteCommit` über die verschlüsselten `parentCommit`-Links erreichbar sein (nicht nur laut compare-API); Config-Commits bauen ihr Manifest aus dem lokal verifizierten Stand. |
 | 21 | Nicht-portable Namen (`a:b`, `CON`, Endpunkt/-leerzeichen), Plugin-Ordner in anderer Schreibweise | Werden nie synchronisiert (und nie als gelöscht gewertet); eigener Plugin-Ordner case-insensitiv ausgeschlossen. |
 | 16 | Klartext-Upload | Brand-Typ `EncryptedBlob`, Laufzeit-Header-Prüfung, Pfade nur aus Object-IDs, Security-Test durchsucht gesamten Remote-Inhalt inkl. Commit-Messages. |
 | 22 | Wiederherstellen einer Version / „Kopie behalten“ bei Konflikt überschreibt ungesicherten Inhalt | Ersetzen nur, wenn der aktuelle Inhalt dem Remote-Manifest entspricht (also in der Historie liegt); sonst erst Sync, sonst Abbruch (`UnsyncedChanges`). Unter Mutex; Hash-Prüfung des verglichenen Inhalts direkt vor dem Schreiben. Verworfene Konfliktkopie → Papierkorb. |
 | 23 | Gelöschte Datei wiederherstellen überschreibt eine neue Datei gleichen Namens | Nie: belegter Name → `Name (restored).ext`. Inhalt gegen `contentHash` des Manifests vor der Löschung geprüft. |
 | 24 | Chunk fehlt/vertauscht/manipuliert | Chunk-Hash aus dem authentisierten Index + GCM je Chunk + Gesamt-Hash; erst nach vollständiger Prüfung im Speicher wird geschrieben. Fuzz-Tests laufen zusätzlich mit 3-Byte-Chunks. |
 | 25 | Umzug: Gerät pusht weiter ins alte Repo / Änderungen gehen beim Wechsel verloren | Authentisierter Marker per CAS blockiert jedes weitere Schreiben ins alte Repo; Wechsel behält die Merge-Basis, lokale Änderungen werden ins neue Repo hochgeladen. Kopie voll verifiziert, fortsetzbar; das alte Repo bleibt vollständig erhalten. Fuzz-Suite mit Umzug. |
+| 26 | Passwortwechsel nach einem Replay signiert das alte Manifest neu (Review F1) | Config-Änderung nur, wenn HEAD == `lastRemoteCommit`, direkt nach einem Sync, Manifest aus `state.remote`; eigener Commit wird im State vermerkt. |
+| 27 | Server lügt bei „Vorfahre?“, gleiche Version auf Geschwister-Commit (F2) | Version streng steigend; Vorfahren-Prüfung über authentisierte Manifest-Kette. |
+| 28 | Umzugskette A→B→C: Gerät schreibt ins Archiv B (F3) | Beim Wechsel wird der Marker des Ziels übernommen; Push auf ein Manifest mit `movedTo` wird verweigert. |
+| 29 | Pathologische Ignore-Regel friert alle Geräte ein (M1) | Matcher ohne Regex, segmentweise, lineare Wildcards; Längen-/Segmentgrenzen. |
+| 30 | Unlesbarer State wird durch leeren ersetzt (L6) | Ungültige Kopien werden gesichert (`.corrupt-<ts>`), unlesbare blockieren das Speichern; Umbenennungen speichern nur echte Änderungen. |
 
 ### Bekannte, akzeptierte Metadaten-Leaks
 
@@ -403,27 +418,32 @@ in einem **neuen** Repository mit dem aktuellen Stand weiterläuft.
 
 Ablauf (`src/sync/VaultMigration.ts`, unter Mutex direkt nach einem erfolgreichen Sync):
 
-1. Quelle: verifizierter Head (Config-MAC, Manifest, Parent-Bindung) muss `lastRemoteCommit` sein.
+1. Quelle: verifizierter Head (Config-MAC, Manifest, Parent- und Config-Bindung) muss `lastRemoteCommit` sein.
 2. Ziel: leer → Bootstrap mit **derselben** öffentlichen Config (gleiche vaultId, Key-Slots, MAC; Passwort und
-   Recovery-Key gelten weiter). Enthält es bereits diesen Vault (abgebrochener Umzug) → Fortsetzung.
+   Recovery-Key gelten weiter). Enthält es bereits diesen Vault (abgebrochener Umzug) → Fortsetzung; dabei wird jedes
+   Objekt, das das Ziel angeblich schon hat, erneut vollständig geprüft, und eine inzwischen geänderte Config übernommen.
 3. Spiegeln in Batches (500 Dateien / 64 MiB): jede Datei aus der Quelle laden, voll verifizieren, mit neuer Nonce
    unter **derselben Object-ID** neu verschlüsseln (Chunks neu), committen (fast-forward). Jedes Zwischen-Manifest
    ist Teilmenge des End-Manifests (keine Pfadkollisionen); Tombstones werden übernommen. Das End-Manifest enthält
    `movedFrom: [{owner, repo, branch, commit}]` (Archiv bis zum letzten Inhalts-Commit). Versionen starten bei
    Quell-Version + 2, bleiben also monoton.
-4. Marker in der Quelle: ein Manifest mit `movedTo: {owner, repo, branch}` (formatVersion 3) per CAS. Hat
-   zwischenzeitlich ein anderes Gerät gepusht, schlägt das fehl → nach einem Sync erneut starten (setzt fort).
-5. Eigenes Gerät: `lastRemoteCommit`, `remote`, `lastManifestVersion` auf das Ziel umgestellt; die Merge-Basis bleibt
-   (gleiche IDs, gleiche Inhalte). Einstellungen zeigen danach auf das neue Repo.
+4. Marker in der Quelle: ein Manifest mit `movedTo: {owner, repo, branch}` per CAS. Hat zwischenzeitlich ein anderes
+   Gerät gepusht, schlägt das fehl → nach einem Sync erneut starten (setzt fort).
+5. Wechsel: Der verifizierte Ziel-Head wird als `pendingSwitch` im State gespeichert, **dann** werden die
+   Einstellungen umgestellt, **dann** übernimmt der State den Head (Merge-Basis bleibt: gleiche IDs, gleiche Inhalte).
+   Das Plugin vollendet einen offenen `pendingSwitch` beim Start und vor jedem Sync; solange er offen ist, verweigert
+   die Engine jeden Sync. Ein Abbruch an beliebiger Stelle lässt State und Einstellungen also nie auseinanderlaufen.
 
-Andere Geräte: `SyncEngine.loadRemote` erkennt den (authentisierten) Marker → `Blocked("VaultMoved")`, nichts
-wird geschrieben. „Switch to new repository“ (`followMove`) prüft das Ziel voll (MAC, Manifest-Bindung, Ziel nennt
-das bisherige Repo in `movedFrom`, Version > zuletzt gesehen) und setzt nur die Remote-Zeiger um – die Basis bleibt,
-lokale ungesicherte Änderungen werden danach ins neue Repo hochgeladen. Ohne Zugriff des Tokens auf das neue Repo
-schlägt der Wechsel ohne Änderung fehl.
+Andere Geräte: `SyncEngine.loadRemote` erkennt den (authentisierten) Marker – erst **nach** den Rollback-Prüfungen,
+damit ein zurückgespielter alter Marker nichts umgeht – → `Blocked("VaultMoved")`, nichts wird geschrieben. „Switch
+to new repository“ (`followMove`) prüft das Ziel voll (MAC, Manifest- und Config-Bindung, Ziel nennt das bisherige
+Repo in `movedFrom`, Version > zuletzt gesehen) und wechselt über denselben `pendingSwitch`. Ist das Ziel selbst schon
+weitergezogen (A → B → C), übernimmt der Wechsel dessen Marker sofort; ein Push auf ein Manifest mit `movedTo` wird
+zusätzlich verweigert. Lokale ungesicherte Änderungen werden danach ins neue Repo hochgeladen. Ohne Zugriff des Tokens
+auf das neue Repo schlägt der Wechsel ohne Änderung fehl. Ein bereits vorhandenes **öffentliches** Ziel-Repo wird nur
+nach ausdrücklicher Bestätigung verwendet.
 
-Format 3 wird nur für Manifeste mit `movedTo`/`movedFrom` geschrieben; Vaults, die nie umgezogen sind, bleiben
-Format 2. Versionsverlauf und gelöschte Dateien lesen nach dem aktuellen Repo die Archive aus `movedFrom`
+Versionsverlauf und gelöschte Dateien lesen nach dem aktuellen Repo die Archive aus `movedFrom`
 (Migrations-Commits werden dabei übersprungen, sie wiederholen nur die letzte Archiv-Version). Nicht mehr
 erreichbare Archive verkürzen nur die Liste. Die Repo-Größe (GitHub-Angabe, verzögert aktualisiert) steht in den
 Einstellungen; ab 1 GiB weist ein Hinweis auf den Umzug hin.
@@ -501,3 +521,43 @@ Nur `src/platform`, `src/ui` und `src/main.ts` importieren `obsidian`.
 * Manuelle Tests auf iOS und Android (Speicherverbrauch großer Anhänge, Suspend/Resume, Keychain-Verfügbarkeit).
 * Optional: automatische Repository-Erstellung, GitHub-App/OAuth-Device-Flow (Interface `AuthProvider`
   vorhanden), Tombstone-Garbage-Collection, Größen-Padding, Schlüsselrotation (Geräte-Widerruf).
+
+## 12. Security-Review (2026-09-29) und Stand der Fixes
+
+Vier getrennte Reviews: Kryptografie/Schlüssel, bösartiges Repository (Schreibzugriff ohne Schlüssel bzw. lügende
+GitHub-Antworten), Geheimnisse/Leaks, lokale Datenintegrität. Keine kritischen Befunde; kein Fehlerpfad liefert
+unauthentisierten Klartext, kein Klartext erreicht GitHub.
+
+| Befund | Schwere | Stand |
+|---|---|---|
+| F1 Passwort-/Recovery-Wechsel signiert ein zurückgespieltes Manifest neu | hoch | behoben (§4, #26) |
+| K1 Rotation widerruft alte Secrets nicht, UI behauptete es | mittel | Texte korrigiert; echter Widerruf offen |
+| F2 Vorfahren-Prüfung nur per compare-API, gleiche Version akzeptiert | mittel | behoben (Manifest-Kette, #27) |
+| F3 Umzugskette A→B→C schreibt ins Archiv | mittel | behoben (#28) |
+| M1 ReDoS in Ignore-Regeln | mittel | behoben (#29) |
+| K2 Config nicht an Manifest gebunden | niedrig | behoben (`configHash`, Format 4) |
+| K3 Lock scheitert still | niedrig | behoben (Prüfung + Abschalten von „merken“) |
+| K4 Neuer Recovery-Key ohne Passwort | niedrig | behoben |
+| F4 Zurückgespielter Marker umgeht Rollback-Prüfung | niedrig | behoben (Reihenfolge) |
+| F5 Fortgesetzter Umzug vertraut Zielobjekten | niedrig | behoben (Re-Verifikation) |
+| F7 Keine Größengrenzen vor dem Entschlüsseln | niedrig | behoben (Config 256 KiB, Manifest 128 MiB, Objekte nach Manifest-Größe, Chunks exakt) – Download selbst bleibt ungebremst |
+| L1 Veralteter Hash-Cache → Änderung wird nie hochgeladen | niedrig | behoben |
+| L2 Wiederherstellen konnte eine neu entstandene Datei überschreiben | niedrig | behoben (create-only, unter Mutex) |
+| L3 Ersetzen ohne erneute Prüfung direkt davor | niedrig | behoben (Prüfung davor, Nachprüfung danach) |
+| L4 „Keep synced“ ohne Existenzprüfung | niedrig | behoben |
+| L5 Sync läuft nach dem Entladen weiter | niedrig | behoben (Stopp-Punkte, „Locked“ bricht ab) |
+| L6 Unlesbarer State wird ersetzt | niedrig | behoben (#30) |
+| Diff ohne Größengrenze | niedrig | behoben (2 MiB, Arbeitsbudget) |
+| Öffentliches Ziel beim Umzug ohne Warnung | niedrig | behoben |
+| Alte Master-Keys bleiben im Schlüsselbund | niedrig | behoben (beim Vault-Wechsel gelöscht) |
+| F6 Wiederverwendete Chunks nicht im Tree geprüft | niedrig | offen |
+| Eigener Plugin-Ordner nur per ID ausgeschlossen, Debug-Log kann Pfade enthalten, Recovery-Key bleibt in der Zwischenablage | niedrig | offen |
+| Release-Workflow (Actions nicht per SHA gepinnt, Job-weite Schreibrechte, keine Provenance) | niedrig | offen |
+| Echter Schlüsselwiderruf (MK-Rotation) | – | offen, eigenes Vorhaben |
+
+Ein zweiter Review der Fixes fand einen Fehler in F1 selbst (Schlüsselwechsel auf einem noch leeren Vault erzeugte einen
+Config-Commit ohne Manifest; andere Geräte wären danach blockiert gewesen). Behoben: jeder Config-Commit trägt ein an
+seinen Parent gebundenes Manifest; die Fuzz-Sitzungen enthalten jetzt zufällige Schlüsselwechsel.
+
+Verhaltensänderung der Ignore-Regeln (M1): `**` innerhalb eines Namens (`a**b`) wirkt wie `*` und überschreitet keine
+Ordnergrenze mehr (wie bei gitignore); Regeln über 1024 Zeichen bzw. 64 Segmente werden ignoriert.

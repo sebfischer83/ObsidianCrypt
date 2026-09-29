@@ -90,7 +90,7 @@ export class RepositoryVerifier {
           for (const chunk of chunks) referenced.add(chunk.id);
           if (chunks.length !== entry.chunks) throw new CryptoError("IntegrityMismatch", "chunk count");
         }
-        const content = await readObjectContent(this.o.remote, engine, commit, id, entry.contentHash, HARD_MAX_FILE_SIZE);
+        const content = await readObjectContent(this.o.remote, engine, commit, id, entry.contentHash, Math.min(entry.size, HARD_MAX_FILE_SIZE));
         if (content.length !== entry.size) throw new CryptoError("IntegrityMismatch", "size");
         content.fill(0);
         report.verified++;

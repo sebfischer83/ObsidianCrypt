@@ -2,6 +2,8 @@ import { decodeText, diffLines, splitLines, type DiffLine } from "../util/diff";
 
 /** Unchanged lines shown around each change; longer unchanged runs are collapsed. */
 const CONTEXT = 3;
+/** Larger files are not compared line by line (would block the UI, especially on mobile). */
+const MAX_DIFF_BYTES = 2 * 1024 * 1024;
 
 /**
  * Renders a line diff of two versions into `container`. `oldLabel`/`newLabel` name the "−" and "+" sides.
@@ -9,6 +11,10 @@ const CONTEXT = 3;
  */
 export function renderDiff(container: HTMLElement, oldBytes: Uint8Array, newBytes: Uint8Array, oldLabel: string, newLabel: string): void {
   container.empty();
+  if (oldBytes.length > MAX_DIFF_BYTES || newBytes.length > MAX_DIFF_BYTES) {
+    container.createEl("p", { text: `Too large for a line comparison (${oldLabel}: ${oldBytes.length} bytes, ${newLabel}: ${newBytes.length} bytes).` });
+    return;
+  }
   const oldText = decodeText(oldBytes);
   const newText = decodeText(newBytes);
   if (oldText === null || newText === null) {

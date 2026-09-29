@@ -1,4 +1,4 @@
-import { Notice, Plugin, setIcon, TAbstractFile, TFile, TFolder } from "obsidian";
+import { Notice, Plugin, setIcon, TAbstractFile, TFile } from "obsidian";
 import { WebCryptoProvider } from "./crypto/WebCryptoProvider";
 import { KeyManager, MIN_PASSWORD_LENGTH, unlockWithPassword, VaultKeys } from "./crypto/KeyManager";
 import { CryptoError } from "./errors/CryptoError";
@@ -23,9 +23,10 @@ import { ConflictResolver } from "./sync/ConflictResolver";
 import { DeletedFiles, type ResolvedDeletedFile } from "./sync/DeletedFiles";
 import { RepositoryVerifier, type VerifyReport } from "./sync/RepositoryVerifier";
 import { VersionHistory, type FileVersion, type HistorySource, type RestoreOutcome } from "./sync/VersionHistory";
-import { followMove, moveVault } from "./sync/VaultMigration";
+import { completeSwitch, followMove, moveVault, sameLocation } from "./sync/VaultMigration";
 import { DEFAULT_CHUNK_SIZE } from "./sync/ChunkedContent";
 import type { RepoLocation } from "./manifest/Manifest";
+import type { PublicVaultConfig } from "./manifest/VaultConfig";
 import { SyncError } from "./errors/SyncError";
 import {
   changeVaultPassword,
@@ -78,6 +79,9 @@ export default class EncryptedSyncPlugin extends Plugin {
   activity!: ActivityLog;
   private sizeCache: { at: number; bytes: number | null } | null = null;
   private sizeWarned = false;
+  private unloading = false;
+  /** Latest verified public config (for the settings UI). */
+  private knownConfig: PublicVaultConfig | null = null;
   explorerStatus!: ExplorerStatus;
   private persistHandle: number | null = null;
 
@@ -87,9 +91,10 @@ export default class EncryptedSyncPlugin extends Plugin {
     this.secrets = new ObsidianSecretStore(this.app);
     this.deviceId = this.loadDeviceId();
     const folder = this.manifest.dir ?? `${this.app.vault.configDir}/plugins/${this.manifest.id}`;
-    const repository = new FileStateRepository(new PluginFolderStore(this.app, folder), this.crypto, `state-${this.deviceId}.json`, this.deviceId, () =>
-      this.logger.warn("local sync state was invalid and has been ignored"),
-    );
+    const repository = new FileStateRepository(new PluginFolderStore(this.app, folder), this.crypto, `state-${this.deviceId}.json`, this.deviceId, (reason) => {
+      this.logger.warn("local sync state problem");
+      new Notice(`Encrypted sync: ${reason}.`, 15000);
+    });
     this.store = await SyncStateStore.open(repository, this.deviceId);
     this.activity = new ActivityLog(new PluginFolderStore(this.app, folder), `activity-${this.deviceId}.json`);
     await this.activity.load();
@@ -136,15 +141,19 @@ export default class EncryptedSyncPlugin extends Plugin {
         if (document.visibilityState === "visible") this.controller.notifyResume();
       });
       await this.tryAutoUnlock();
+      // A vault move interrupted before its settings switch completes here.
+      await this.finishPendingSwitch().catch((error: unknown) => logUnexpected(this.settings.debugLogging, "finish repository switch", error));
       this.controller.start();
     });
   }
 
   override onunload(): void {
+    // A running sync stops at its next safe point instead of writing on behind a newly loaded instance.
+    this.unloading = true;
     this.controller?.stop();
     this.explorerStatus?.destroy();
     if (this.persistHandle !== null) window.clearTimeout(this.persistHandle);
-    if (this.store?.isDirty) void this.store.persist();
+    if (this.store?.isDirty) this.store.persist().catch(() => undefined);
     // Only the in-memory copy is dropped; a remembered key stays in the OS keychain.
     this.keyManager.lock();
   }
@@ -238,6 +247,7 @@ export default class EncryptedSyncPlugin extends Plugin {
       getKeys: () => this.keyManager.keys,
       filterSettings: this.filterSettings(),
       limits: { maxFileSize: this.settings.maxFileSizeMB * MIB },
+      shouldStop: () => this.unloading,
       deviceId: this.deviceId,
       logger: this.logger,
     });
@@ -245,8 +255,15 @@ export default class EncryptedSyncPlugin extends Plugin {
     return engine;
   }
 
-  private runEngine(mode: SyncMode): Promise<SyncReport> {
-    return this.buildEngine().sync(mode);
+  private async runEngine(mode: SyncMode): Promise<SyncReport> {
+    // Runs under the sync mutex: a repository switch interrupted earlier is completed before anything else.
+    await this.finishPendingSwitch();
+    const engine = this.buildEngine();
+    try {
+      return await engine.sync(mode);
+    } finally {
+      if (engine.lastConfig) this.knownConfig = engine.lastConfig;
+    }
   }
 
   // ───────────────────────── keys ─────────────────────────
@@ -303,9 +320,28 @@ export default class EncryptedSyncPlugin extends Plugin {
   lock(): void {
     const vaultId = this.store.state.vaultId;
     this.keyManager.lock();
-    if (vaultId) this.secrets.delete(this.masterKeySecretId(vaultId));
+    const removed = vaultId ? this.forgetMasterKey(vaultId) : true;
     void this.controller.refreshStatus();
-    new Notice("Encrypted sync locked. The vault password is required for the next sync.");
+    if (removed) new Notice("Encrypted sync locked. The vault password is required for the next sync.");
+    else {
+      // The keychain refused the delete: make sure the key is at least never used automatically again.
+      this.settings.rememberKey = false;
+      void this.saveSettings();
+      new Notice("Locked for this session, but the remembered vault key could not be removed from the system keychain. Automatic unlocking was turned off; remove the entry manually if needed.", 15000);
+    }
+  }
+
+  /** Deletes a remembered master key and reports whether it is really gone. */
+  private forgetMasterKey(vaultId: string): boolean {
+    const id = this.masterKeySecretId(vaultId);
+    this.secrets.delete(id);
+    return this.secrets.get(id) === null;
+  }
+
+  /** Before switching this device to another vault: the previous vault's remembered key must not stay behind. */
+  private forgetPreviousVaultKey(nextVaultId: string | null): void {
+    const previous = this.store.state.vaultId;
+    if (previous && previous !== nextVaultId) this.forgetMasterKey(previous);
   }
 
   // ───────────────────────── setup flows ─────────────────────────
@@ -322,6 +358,7 @@ export default class EncryptedSyncPlugin extends Plugin {
   }
 
   async createNewVault(password: string): Promise<string | null> {
+    this.forgetPreviousVaultKey(null);
     const result = await initializeNewVault({
       crypto: this.crypto,
       remote: this.buildRemote(),
@@ -337,25 +374,49 @@ export default class EncryptedSyncPlugin extends Plugin {
   }
 
   async connectVault(secret: UnlockSecret): Promise<void> {
+    const previous = this.store.state.vaultId;
     const result = await connectExistingVault({ crypto: this.crypto, remote: this.buildRemote(), store: this.store, secret, deviceId: this.deviceId });
+    if (previous && previous !== result.keys.vaultId) this.forgetMasterKey(previous);
     this.keyManager.setKeys(result.keys);
     this.rememberKeys(result.keys);
   }
 
-  async changePassword(currentPassword: string, newPassword: string): Promise<void> {
-    const keys = this.keyManager.keys;
+  /** Verifies the vault password against the current remote config (old password → master key). */
+  private async verifyPassword(password: string): Promise<void> {
     const inspection = await inspectRemote(this.buildRemote());
     if (inspection.kind !== "vault") throw new CryptoError("InvalidInput", "repository contains no encrypted vault");
-    // Verify the current password (old password → master key) before re-wrapping.
-    const check = await unlockWithPassword(this.crypto, inspection.config, currentPassword);
+    const check = await unlockWithPassword(this.crypto, inspection.config, password);
     check.destroy();
-    await this.controller.runExclusive(() => changeVaultPassword({ crypto: this.crypto, remote: this.buildRemote(), keys, deviceId: this.deviceId, newPassword }));
   }
 
-  async newRecoveryKey(): Promise<void> {
+  /**
+   * Runs a config change (password, recovery key) directly after a successful sync, so it is built on the
+   * verified local state; retried if another device pushed in between.
+   */
+  private async configChange<T>(change: () => Promise<T>): Promise<T> {
+    for (let attempt = 0; ; attempt++) {
+      if (!(await this.controller.runNow("full"))) throw new SyncError("InvalidState", "synchronisation is not possible right now (locked, blocked or already running)");
+      try {
+        return await this.controller.runExclusive(change);
+      } catch (error: unknown) {
+        if (!(error instanceof SyncError) || error.code !== "ConcurrentRemoteUpdate" || attempt >= 2) throw error;
+      }
+    }
+  }
+
+  async changePassword(currentPassword: string, newPassword: string): Promise<void> {
     const keys = this.keyManager.keys;
-    const key = await this.controller.runExclusive(() => rotateRecoveryKey({ crypto: this.crypto, remote: this.buildRemote(), keys, deviceId: this.deviceId }));
-    await showRecoveryKey(this.app, key);
+    await this.verifyPassword(currentPassword);
+    this.knownConfig = await this.configChange(() => changeVaultPassword({ crypto: this.crypto, remote: this.buildRemote(), store: this.store, keys, deviceId: this.deviceId, newPassword }));
+  }
+
+  /** A new recovery key is a long-term credential: only with the current password. */
+  async newRecoveryKey(currentPassword: string): Promise<void> {
+    const keys = this.keyManager.keys;
+    await this.verifyPassword(currentPassword);
+    const result = await this.configChange(() => rotateRecoveryKey({ crypto: this.crypto, remote: this.buildRemote(), store: this.store, keys, deviceId: this.deviceId }));
+    this.knownConfig = result.config;
+    await showRecoveryKey(this.app, result.recoveryKey);
   }
 
   // ───────────────────────── version history ─────────────────────────
@@ -386,7 +447,8 @@ export default class EncryptedSyncPlugin extends Plugin {
   }
 
   async restoreVersionAsCopy(path: string, version: FileVersion, content: Uint8Array): Promise<string> {
-    const copy = await this.versionHistory().restoreAsCopy(path, version, content);
+    const history = this.versionHistory();
+    const copy = await this.controller.runExclusive(() => history.restoreAsCopy(path, version, content));
     await this.logAction(`Version from ${new Date(version.date).toLocaleString()} restored as copy`, [{ action: "restored", path: copy, other: path }]);
     this.controller.notifyChange();
     return copy;
@@ -400,7 +462,7 @@ export default class EncryptedSyncPlugin extends Plugin {
 
   async restoreDeletedFile(deleted: DeletedFiles, file: ResolvedDeletedFile): Promise<string> {
     const content = await deleted.load(file);
-    const path = await deleted.restore(file, content);
+    const path = await this.controller.runExclusive(() => deleted.restore(file, content));
     await this.logAction("Deleted file restored", [{ action: "restored", path, ...(path !== file.path ? { other: file.path } : {}) }]);
     this.controller.notifyChange();
     return path;
@@ -482,13 +544,13 @@ export default class EncryptedSyncPlugin extends Plugin {
   }
 
   /** What a target repository for a move currently is. */
-  async inspectMoveTarget(target: RepoLocation): Promise<"missing" | "empty" | "resumable" | "foreign" | "otherVault"> {
+  async inspectMoveTarget(target: RepoLocation): Promise<{ state: "missing" | "empty" | "resumable" | "foreign" | "otherVault"; isPrivate: boolean }> {
     const api = this.buildApi(target.owner, target.repo);
-    if (!(await api.getRepository()).exists) return "missing";
+    const repo = await api.getRepository();
+    if (!repo.exists) return { state: "missing", isPrivate: false };
     const inspection = await inspectRemote(this.buildRemote(target.owner, target.repo, target.branch));
-    if (inspection.kind === "uninitialized") return "empty";
-    if (inspection.kind === "foreign") return "foreign";
-    return inspection.config.vaultId === this.store.state.vaultId ? "resumable" : "otherVault";
+    const state = inspection.kind === "uninitialized" ? "empty" : inspection.kind === "foreign" ? "foreign" : inspection.config.vaultId === this.store.state.vaultId ? "resumable" : "otherVault";
+    return { state, isPrivate: repo.isPrivate };
   }
 
   async createMoveTarget(target: RepoLocation): Promise<void> {
@@ -514,24 +576,38 @@ export default class EncryptedSyncPlugin extends Plugin {
         onProgress,
       }),
     );
-    await this.switchLocation(target);
+    await this.finishPendingSwitch();
     await this.logAction(`Vault moved from ${source.owner}/${source.repo} to ${target.owner}/${target.repo} (${result.copied} files copied)`, []);
     void this.controller.requestSync("full");
     return result.copied;
   }
 
-  /** After another device moved the vault: continue in the repository its marker names. */
+  /** After another device moved the vault: continue in the repository its marker names (following chains). */
   async followVaultMove(): Promise<void> {
-    const moved = this.store.state.movedTo;
-    if (!moved) return;
-    const source = this.currentLocation();
-    await this.controller.runExclusive(() =>
-      followMove({ crypto: this.crypto, keys: this.keyManager.keys, store: this.store, deviceId: this.deviceId, sourceLocation: source, target: this.buildRemote(moved.owner, moved.repo, moved.branch) }),
-    );
-    await this.switchLocation(moved);
-    await this.logAction(`Switched to the new repository ${moved.owner}/${moved.repo}`, []);
+    for (let hop = 0; hop < 5; hop++) {
+      const moved = this.store.state.movedTo;
+      if (!moved) break;
+      const source = this.currentLocation();
+      await this.controller.runExclusive(() =>
+        followMove({ crypto: this.crypto, keys: this.keyManager.keys, store: this.store, deviceId: this.deviceId, sourceLocation: source, target: this.buildRemote(moved.owner, moved.repo, moved.branch) }),
+      );
+      await this.finishPendingSwitch();
+      await this.logAction(`Switched to the new repository ${moved.owner}/${moved.repo}`, []);
+    }
     this.controller.clearBlock();
     void this.controller.requestSync("full");
+  }
+
+  /**
+   * Completes a recorded repository switch: settings first, then the sync state. Both steps are idempotent,
+   * so an interruption at any point is finished by the next call (plugin start, every sync).
+   */
+  private async finishPendingSwitch(): Promise<void> {
+    const pending = this.store.state.pendingSwitch;
+    if (!pending) return;
+    if (!sameLocation(this.currentLocation(), pending.location)) await this.switchLocation(pending.location);
+    completeSwitch(this.store.state);
+    await this.store.persist();
   }
 
   private async switchLocation(target: RepoLocation): Promise<void> {
@@ -559,18 +635,18 @@ export default class EncryptedSyncPlugin extends Plugin {
     await this.controller.refreshStatus();
   }
 
-  private async keepSyncedVersion(conflict: ConflictRecord, copyHash: string): Promise<void> {
-    await this.controller.runExclusive(() => this.conflictResolver().keepSynced(conflict, copyHash));
+  private async keepSyncedVersion(conflict: ConflictRecord, copyHash: string, syncedHash: string): Promise<void> {
+    await this.controller.runExclusive(() => this.conflictResolver().keepSynced(conflict, copyHash, syncedHash));
     await this.logAction("Conflict resolved: kept the synced version", [{ action: "trashed", path: conflict.conflictPath as string }]);
     this.controller.notifyChange();
     await this.controller.refreshStatus();
   }
 
-  private async keepConflictCopy(conflict: ConflictRecord, copyHash: string): Promise<void> {
+  private async keepConflictCopy(conflict: ConflictRecord, copyHash: string, syncedHash: string): Promise<void> {
     const resolver = this.conflictResolver();
     // Like restoring a version: the replaced content must be in the remote history first.
     if (!(await resolver.canReplaceSynced(conflict))) await this.controller.runNow("full");
-    await this.controller.runExclusive(() => resolver.keepCopy(conflict, copyHash));
+    await this.controller.runExclusive(() => resolver.keepCopy(conflict, copyHash, syncedHash));
     await this.logAction("Conflict resolved: kept the copy", [
       { action: "restored", path: conflict.path, other: conflict.conflictPath as string },
       { action: "trashed", path: conflict.conflictPath as string },
@@ -677,8 +753,8 @@ export default class EncryptedSyncPlugin extends Plugin {
       dismiss: (id) => this.dismissConflict(id),
       load: (conflict) => this.conflictResolver().load(conflict),
       hash: (data) => this.crypto.hash(data),
-      keepSynced: (conflict, copyHash) => this.keepSyncedVersion(conflict, copyHash),
-      keepCopy: (conflict, copyHash) => this.keepConflictCopy(conflict, copyHash),
+      keepSynced: (conflict, copyHash, syncedHash) => this.keepSyncedVersion(conflict, copyHash, syncedHash),
+      keepCopy: (conflict, copyHash, syncedHash) => this.keepConflictCopy(conflict, copyHash, syncedHash),
     }).open();
   }
 
@@ -719,7 +795,8 @@ export default class EncryptedSyncPlugin extends Plugin {
     this.registerEvent(
       this.app.vault.on("rename", (file: TAbstractFile, oldPath: string) => {
         // Keep stable object ids across renames/moves (files and whole folders).
-        if (this.store.recordRename(oldPath, file.path) || file instanceof TFolder) this.schedulePersist();
+        // Persist only real changes: a fresh state must never be written just because a folder was renamed.
+        if (this.store.recordRename(oldPath, file.path)) this.schedulePersist();
         changed();
       }),
     );
@@ -729,7 +806,7 @@ export default class EncryptedSyncPlugin extends Plugin {
     if (this.persistHandle !== null) window.clearTimeout(this.persistHandle);
     this.persistHandle = window.setTimeout(() => {
       this.persistHandle = null;
-      if (!this.controller.isSyncing) void this.store.persist();
+      if (!this.controller.isSyncing) this.store.persist().catch((error: unknown) => logUnexpected(this.settings.debugLogging, "persist state", error));
       else this.schedulePersist();
     }, 2000);
   }
@@ -740,7 +817,7 @@ export default class EncryptedSyncPlugin extends Plugin {
 
   /** Whether the remote config seen by the last sync has a recovery key slot. */
   hasRecoverySlot(): boolean | null {
-    const config = this.lastEngine?.lastConfig;
+    const config = this.knownConfig;
     return config ? config.keySlots.some((s) => s.type === "recovery") : null;
   }
 }

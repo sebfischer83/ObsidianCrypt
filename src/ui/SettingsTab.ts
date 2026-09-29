@@ -7,7 +7,7 @@ import type EncryptedSyncPlugin from "../main";
 import { MAX_FILE_SIZE_MB_LIMIT } from "../settings";
 import { MAX_VERSION_LIMIT } from "../sync/VersionHistory";
 import { IGNORE_FILE } from "../vault/SyncFilter";
-import { confirmDialog, formatBytes } from "./Modals";
+import { confirmDialog, formatBytes, promptVaultSecret } from "./Modals";
 import { SetupWizard } from "./SetupWizard";
 import { statusText } from "./StatusBar";
 
@@ -140,15 +140,26 @@ export class SettingsTab extends PluginSettingTab {
     this.passwordSection(containerEl, unlocked);
     new Setting(containerEl)
       .setName("Recovery key")
-      .setDesc("Create a new recovery key. The previous recovery key stops working.")
+      .setDesc("Create a new recovery key (requires the vault password). The new key replaces the old one for the current repository.")
       .addButton((b) =>
         b
           .setButtonText("Create new recovery key")
           .setDisabled(!unlocked)
           .onClick(async () => {
-            if (!(await confirmDialog(this.app, "Create a new recovery key?", ["The old recovery key will no longer work."], "Create"))) return;
+            const ok = await confirmDialog(
+              this.app,
+              "Create a new recovery key?",
+              [
+                "The old recovery key is removed from the current configuration.",
+                "It is NOT revoked: older commits in the repository history still contain it, so anyone with the old key and read access to the repository (or a copy of it) can still decrypt the vault. If the old key was exposed, keep the repository private, move the vault to a new repository afterwards and delete the old repository.",
+              ],
+              "Continue",
+            );
+            if (!ok) return;
+            const secret = await promptVaultSecret(this.app, "Confirm with your password", "Enter the current vault password to create a new recovery key.", false);
+            if (!secret) return;
             try {
-              await this.plugin.newRecoveryKey();
+              await this.plugin.newRecoveryKey(secret.value);
             } catch (error: unknown) {
               new Notice(describeError(error), 8000);
             }
@@ -297,7 +308,7 @@ export class SettingsTab extends PluginSettingTab {
         t.inputEl.autocomplete = autocomplete;
         t.onChange(set);
       });
-    new Setting(containerEl).setName("Change password").setDesc("Re-encrypts only the vault key; your files are not re-uploaded. Other devices keep working.");
+    new Setting(containerEl).setName("Change password").setDesc("Re-encrypts only the vault key; your files are not re-uploaded. Other devices keep working. The old password is not revoked: older commits in the repository history still accept it – if it leaked, also move the vault to a new repository and delete the old one.");
     pw(new Setting(containerEl).setName("Current password").setClass("setting-indent"), (v) => (current = v), "current-password");
     pw(new Setting(containerEl).setName("New password").setClass("setting-indent"), (v) => (next = v), "new-password");
     pw(new Setting(containerEl).setName("Repeat new password").setClass("setting-indent"), (v) => (repeat = v), "new-password").addButton((b) =>

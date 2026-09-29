@@ -161,17 +161,19 @@ describe("moving a vault to a new repository", () => {
   });
 
 
-  it("recovers when the app stops between the move and the settings switch", async () => {
-    const { a } = await twoDevices();
+  it("finishes a switch interrupted before the settings changed", async () => {
+    const { remote: old, a } = await twoDevices();
     a.fs.setText("n.md", "before");
     await a.sync();
     const target = new FakeRemoteRepository();
     await move(a, target);
-    // Settings were never switched: after a restart the device still talks to the old repository.
+    // The app stops before settings and state are switched: after a restart the switch is still recorded.
     await a.restart();
+    expect(a.store.state.pendingSwitch).toMatchObject({ location: NEW });
+    // Nothing is synchronised in between – neither with the old nor the new repository.
+    expect(await blockedReason(a.sync())).toBe("InvalidState");
+    expect(old.head).not.toBeNull();
     a.fs.setText("n.md", "edited after restart");
-    expect(await blockedReason(a.sync())).toBe("VaultMoved");
-    await followMove({ crypto, keys: a.keys, store: a.store, deviceId: a.deviceId, sourceLocation: OLD, target });
     a.switchRemote(target);
     await a.sync();
     const b = new Device(target);
@@ -179,6 +181,35 @@ describe("moving a vault to a new repository", () => {
     await b.sync();
     expect(b.fs.text("n.md")).toBe("edited after restart");
   });
+
+  it("follows a chain of moves instead of writing into an archive (F3)", async () => {
+    const { a, b } = await twoDevices();
+    a.fs.setText("n.md", "v1");
+    await a.sync();
+    await b.sync();
+    const second = new FakeRemoteRepository();
+    const third = new FakeRemoteRepository();
+    const SECOND = NEW;
+    const THIRD: RepoLocation = { owner: "alice", repo: "vault-3", branch: "main" };
+    await move(a, second);
+    a.switchRemote(second);
+    await moveVault({ crypto, keys: a.keys, store: a.store, deviceId: a.deviceId, source: second, sourceLocation: SECOND, target: third, targetLocation: THIRD });
+    a.switchRemote(third);
+
+    // b is still on the first repository and follows one hop: the second one announces the next move.
+    expect(await blockedReason(b.sync())).toBe("VaultMoved");
+    await followMove({ crypto, keys: b.keys, store: b.store, deviceId: b.deviceId, sourceLocation: OLD, target: second });
+    b.switchRemote(second);
+    expect(b.store.state.movedTo).toMatchObject(THIRD);
+    b.fs.setText("n.md", "edited by b");
+    expect(await blockedReason(b.sync())).toBe("VaultMoved");
+    await followMove({ crypto, keys: b.keys, store: b.store, deviceId: b.deviceId, sourceLocation: SECOND, target: third });
+    b.switchRemote(third);
+    await b.sync();
+    await a.sync();
+    expect(a.fs.text("n.md")).toBe("edited by b");
+  });
+
   it("refuses unsafe targets and states", async () => {
     const { a } = await twoDevices();
     a.fs.setText("x.md", "x");

@@ -15,7 +15,7 @@ import {
   ValidationError,
 } from "../util/validate";
 import { isValidVaultPath, pathKey } from "../vault/PathUtils";
-import { MANIFEST_TYPE, MAX_MANIFEST_FORMAT_VERSION, MOVE_FORMAT_VERSION, type ArchivedRepo, type Manifest, type ManifestEntry, type RepoLocation } from "./Manifest";
+import { CONFIG_HASH_FORMAT_VERSION, MANIFEST_TYPE, MAX_MANIFEST_FORMAT_VERSION, MOVE_FORMAT_VERSION, type ArchivedRepo, type Manifest, type ManifestEntry, type RepoLocation } from "./Manifest";
 
 export const MAX_MANIFEST_ENTRIES = 1_000_000;
 /** Upper bound for the chunk count of one file (far above HARD_MAX_FILE_SIZE / chunk size). */
@@ -51,7 +51,7 @@ export function parseManifestObject(raw: unknown, expectedVaultId: string): Mani
   expectLiteral(record.type, MANIFEST_TYPE, "manifest.type");
   const formatVersion = expectInteger(record.formatVersion, "manifest.formatVersion", 1);
   if (formatVersion > MAX_MANIFEST_FORMAT_VERSION) throw SyncError.blocked("UnknownFormatVersion");
-  expectOnlyKeys(record, ["type", "formatVersion", "vaultId", "version", "parentCommit", "device", "updatedAt", "entries", "movedTo", "movedFrom"], "manifest");
+  expectOnlyKeys(record, ["type", "formatVersion", "vaultId", "version", "parentCommit", "device", "updatedAt", "entries", "movedTo", "movedFrom", "configHash"], "manifest");
   const hasMoveFields = record.movedTo !== undefined || record.movedFrom !== undefined;
   if (hasMoveFields && formatVersion < MOVE_FORMAT_VERSION) throw new ValidationError("manifest.formatVersion", "move fields need format 3");
   const vaultId = expectString(record.vaultId, "manifest.vaultId", HEX_32);
@@ -94,7 +94,10 @@ export function parseManifestObject(raw: unknown, expectedVaultId: string): Mani
           return { ...parseRepoLocation({ owner: r.owner, repo: r.repo, branch: r.branch }, `manifest.movedFrom.${i}`), commit: expectString(r.commit, `manifest.movedFrom.${i}.commit`, GIT_SHA) };
         });
   if (movedFrom && movedFrom.length > 100) throw new ValidationError("manifest.movedFrom", "too many archives");
-  return { ...manifest, ...(movedTo ? { movedTo } : {}), ...(movedFrom ? { movedFrom } : {}) };
+  const configHash = record.configHash === undefined ? undefined : expectString(record.configHash, "manifest.configHash", HEX_64);
+  if (formatVersion >= CONFIG_HASH_FORMAT_VERSION && configHash === undefined) throw new ValidationError("manifest.configHash", "missing");
+  if (configHash !== undefined && formatVersion < CONFIG_HASH_FORMAT_VERSION) throw new ValidationError("manifest.configHash", "needs format 4");
+  return { ...manifest, ...(movedTo ? { movedTo } : {}), ...(movedFrom ? { movedFrom } : {}), ...(configHash ? { configHash } : {}) };
 }
 
 const OWNER = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;

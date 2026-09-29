@@ -4,6 +4,7 @@ import { MemoryStateRepository } from "../../src/state/StateRepository";
 import { SyncStateStore } from "../../src/state/SyncStateStore";
 import { SyncEngine, type SyncLimits, type SyncMode, type SyncReport } from "../../src/sync/SyncEngine";
 import { connectExistingVault, initializeNewVault } from "../../src/sync/VaultSetup";
+import { completeSwitch } from "../../src/sync/VaultMigration";
 import type { FilterSettings } from "../../src/vault/SyncFilter";
 import { FakeRemoteRepository } from "./FakeRemoteRepository";
 import type { RemoteRepository } from "../../src/remote/RemoteRepository";
@@ -62,9 +63,10 @@ export class Device {
     });
   }
 
-  /** Points this device at another repository (settings change after a vault move). */
+  /** Points this device at another repository and completes a recorded vault switch (like the plugin). */
   switchRemote(remote: RemoteRepository): void {
     this.remote = remote;
+    completeSwitch(this.store.state);
     this.buildEngine();
   }
 
