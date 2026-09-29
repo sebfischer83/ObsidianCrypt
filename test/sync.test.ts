@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { isLive, type LiveEntry } from "../src/manifest/Manifest";
 import { SyncError } from "../src/errors/SyncError";
-import { GitHubError } from "../src/errors/GitHubError";
+import { RemoteError } from "../src/errors/RemoteError";
 import { CryptoError } from "../src/errors/CryptoError";
 import { CONFIG_PATH, MANIFEST_PATH } from "../src/remote/RemoteLayout";
 import { changeVaultPassword } from "../src/sync/VaultSetup";
@@ -362,7 +362,7 @@ describe("offline operation (§34–§35)", () => {
     await a.sync();
     remote.offline = true;
     a.fs.setText("n.md", "offline edit");
-    await expect(a.sync()).rejects.toBeInstanceOf(GitHubError);
+    await expect(a.sync()).rejects.toBeInstanceOf(RemoteError);
     expect(a.fs.text("n.md")).toBe("offline edit");
     expect(await a.engine.countPendingChanges()).toBe(1);
     remote.offline = false;
@@ -466,10 +466,10 @@ describe("crash safety (§42, §53 failure injection)", () => {
     remote.onReadObject = () => {
       if (++reads === 3) {
         remote.onReadObject = null;
-        throw new GitHubError("Network"); // connection lost in the middle of applying
+        throw new RemoteError("Network"); // connection lost in the middle of applying
       }
     };
-    await expect(b.sync()).rejects.toBeInstanceOf(GitHubError);
+    await expect(b.sync()).rejects.toBeInstanceOf(RemoteError);
     expect(b.store.state.journal).not.toBeNull();
     await b.restart();
     const report = await b.sync();

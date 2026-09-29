@@ -1,4 +1,4 @@
-import { GitHubError } from "../../src/errors/GitHubError";
+import { RemoteError } from "../../src/errors/RemoteError";
 import { SyncError } from "../../src/errors/SyncError";
 import { serializeVaultConfig, type PublicVaultConfig } from "../../src/manifest/VaultConfig";
 import { assertEncrypted, CONFIG_PATH, isMigrationMessage, MANIFEST_PATH, objectIdFromPath, objectPath, parseCommitDevice } from "../../src/remote/RemoteLayout";
@@ -37,7 +37,7 @@ export class FakeRemoteRepository implements RemoteRepository {
 
   private touch(): void {
     this.requestCount++;
-    if (this.offline) throw new GitHubError("Network");
+    if (this.offline) throw new RemoteError("Network");
   }
 
   private crash(point: CrashPoint): void {
@@ -59,7 +59,7 @@ export class FakeRemoteRepository implements RemoteRepository {
 
   private commit(sha: string): Commit {
     const c = this.commits.get(sha);
-    if (!c) throw new GitHubError("NotFound", 404);
+    if (!c) throw new RemoteError("NotFound", 404);
     return c;
   }
 
@@ -88,7 +88,7 @@ export class FakeRemoteRepository implements RemoteRepository {
     this.objectReads++;
     this.onReadObject?.(objectId);
     const data = this.commit(commit).files.get(objectPath(objectId));
-    if (!data) throw new GitHubError("NotFound", 404);
+    if (!data) throw new RemoteError("NotFound", 404);
     return data.slice();
   }
 
@@ -156,7 +156,7 @@ export class FakeRemoteRepository implements RemoteRepository {
           break;
         case "putUploadedObject": {
           const uploaded = this.uploads.get(change.handle);
-          if (!uploaded) throw new GitHubError("InvalidResponse");
+          if (!uploaded) throw new RemoteError("InvalidResponse");
           files.set(objectPath(change.objectId), uploaded);
           break;
         }
@@ -188,7 +188,11 @@ export class FakeRemoteRepository implements RemoteRepository {
       await hook();
     }
     this.crash("beforeRefUpdate");
-    if (this.head !== expectedParent) throw new SyncError("ConcurrentRemoteUpdate");
+    if (this.head !== expectedParent) {
+      // Our commit already landed (a retry after an unknown outcome): not an error.
+      if (this.head !== null && (this.head === newCommit || (await this.isAncestor(newCommit, this.head)))) return;
+      throw new SyncError("ConcurrentRemoteUpdate");
+    }
     this.commit(newCommit);
     this.head = newCommit;
     this.crash("afterRefUpdate");

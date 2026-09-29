@@ -99,8 +99,14 @@ export class Device {
   }
 }
 
+/** Two connected devices on a fresh in-memory fake remote. */
 export async function twoDevices(limits: Partial<SyncLimits> = {}): Promise<{ remote: FakeRemoteRepository; a: Device; b: Device }> {
-  const remote = new FakeRemoteRepository();
+  return twoDevicesOn(() => new FakeRemoteRepository(), limits);
+}
+
+/** Two connected devices on any backend (used to run the same scenarios against every RemoteRepository). */
+export async function twoDevicesOn<R extends RemoteRepository>(fresh: () => R, limits: Partial<SyncLimits> = {}): Promise<{ remote: R; a: Device; b: Device }> {
+  const remote = fresh();
   const a = new Device(remote, undefined, limits);
   await a.createVault();
   const b = new Device(remote, undefined, limits);

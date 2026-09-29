@@ -1,10 +1,15 @@
 import { utf8Decode } from "../util/bytes";
 
+export type HttpMethod = "GET" | "HEAD" | "POST" | "PATCH" | "PUT" | "DELETE" | "PROPFIND" | "MKCOL";
+
 export interface HttpRequest {
-  readonly method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE";
+  readonly method: HttpMethod;
   readonly url: string;
   readonly headers: Readonly<Record<string, string>>;
-  readonly body?: string;
+  /** Text (JSON, XML) or binary body. */
+  readonly body?: string | Uint8Array;
+  /** Content type of the body; defaults to application/json for text bodies. */
+  readonly contentType?: string;
   readonly timeoutMs: number;
 }
 
@@ -16,7 +21,8 @@ export interface HttpResponse {
 }
 
 /**
- * Transport abstraction. Production: Obsidian `requestUrl` (works on desktop and mobile, no CORS).
+ * Transport abstraction shared by all backends. Production: Obsidian `requestUrl` (works on desktop and mobile,
+ * no CORS).
  * Implementations must throw a plain Error only for transport failures (offline, DNS, timeout) and
  * return every HTTP status (including 4xx/5xx) as a response.
  */

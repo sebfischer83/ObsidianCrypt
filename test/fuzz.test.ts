@@ -8,7 +8,7 @@ import { CrashError, FakeRemoteRepository } from "./fakes/FakeRemoteRepository";
 import { SyncError } from "../src/errors/SyncError";
 import { followMove, moveVault } from "../src/sync/VaultMigration";
 import { changeVaultPassword } from "../src/sync/VaultSetup";
-import { GitHubError } from "../src/errors/GitHubError";
+import { RemoteError } from "../src/errors/RemoteError";
 
 /** Every plaintext ever committed (recoverable from the git history), chunked files reassembled. */
 async function remoteHistory(remote: FakeRemoteRepository, device: Device): Promise<Set<string>> {
@@ -156,14 +156,14 @@ describe(`randomised sessions with crashes, restarts and offline periods${varian
           remote.onReadObject = () => {
             if (++reads === 2) {
               remote.onReadObject = null;
-              throw new GitHubError("Network");
+              throw new RemoteError("Network");
             }
           };
         }
         try {
           await d.sync();
         } catch (error: unknown) {
-          if (!(error instanceof CrashError) && !(error instanceof GitHubError)) throw error;
+          if (!(error instanceof CrashError) && !(error instanceof RemoteError)) throw error;
           if (error instanceof CrashError || rnd() < 0.5) await d.restart();
         } finally {
           remote.crashAt = null;
@@ -197,8 +197,8 @@ function fuzzSeeds(): string | undefined {
 
 describe("randomised sessions with a vault move in the middle", () => {
   const SEEDS = Number(fuzzSeeds() ?? 40);
-  const OLD = { owner: "alice", repo: "vault", branch: "main" };
-  const NEW = { owner: "alice", repo: "vault-2", branch: "main" };
+  const OLD = { kind: "github", owner: "alice", repo: "vault", branch: "main" } as const;
+  const NEW = { kind: "github", owner: "alice", repo: "vault-2", branch: "main" } as const;
   for (let seed = 1; seed <= SEEDS; seed++) {
     it(`seed ${seed}`, async () => {
       const rnd = prng(seed * 104729);

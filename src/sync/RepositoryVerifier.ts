@@ -2,7 +2,7 @@ import type { CryptoProvider } from "../crypto/CryptoProvider";
 import { EncryptionEngine } from "../crypto/EncryptionEngine";
 import type { VaultKeys } from "../crypto/KeyManager";
 import { CryptoError } from "../errors/CryptoError";
-import { GitHubError } from "../errors/GitHubError";
+import { RemoteError } from "../errors/RemoteError";
 import { SyncError } from "../errors/SyncError";
 import { describeError } from "../errors/VaultSyncError";
 import { liveEntries } from "../manifest/Manifest";
@@ -95,7 +95,7 @@ export class RepositoryVerifier {
         content.fill(0);
         report.verified++;
       } catch (error: unknown) {
-        if (error instanceof GitHubError && error.category === "NotFound") report.problems.push({ path: entry.path, problem: "missing" });
+        if (error instanceof RemoteError && error.category === "NotFound") report.problems.push({ path: entry.path, problem: "missing" });
         else if (error instanceof CryptoError) report.problems.push({ path: entry.path, problem: "corrupted" });
         else {
           report.stopped = describeError(error);

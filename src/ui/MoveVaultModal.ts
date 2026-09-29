@@ -1,7 +1,13 @@
 import { Modal, Notice, Setting, type ButtonComponent } from "obsidian";
 import { describeError } from "../errors/VaultSyncError";
 import type EncryptedSyncPlugin from "../main";
-import type { RepoLocation } from "../manifest/Manifest";
+import { describeLocation, parseBackendLocation, type BackendLocation } from "../remote/BackendLocation";
+
+interface GitHubTarget {
+  readonly owner: string;
+  readonly repo: string;
+  readonly branch: string;
+}
 import { confirmDialog, formatBytes } from "./Modals";
 
 type TargetState = Awaited<ReturnType<EncryptedSyncPlugin["inspectMoveTarget"]>>["state"];
@@ -16,7 +22,7 @@ const TARGET_TEXT: Record<TargetState, string> = {
 
 /** Continue the vault in a fresh repository to get rid of an ever-growing history. */
 export class MoveVaultModal extends Modal {
-  private target: RepoLocation;
+  private target: GitHubTarget;
   private state: TargetState | null = null;
   private isPrivate = false;
   private statusEl: HTMLElement | null = null;
@@ -26,18 +32,18 @@ export class MoveVaultModal extends Modal {
   constructor(private readonly plugin: EncryptedSyncPlugin) {
     super(plugin.app);
     const current = plugin.currentLocation();
-    this.target = { owner: current.owner, repo: `${current.repo}-2`, branch: current.branch };
+    this.target = current.kind === "github" ? { owner: current.owner, repo: `${current.repo}-2`, branch: current.branch } : { owner: "", repo: "", branch: "main" };
   }
 
   override onOpen(): void {
     this.titleEl.setText("Move vault to a new repository");
     const { contentEl } = this;
     const current = this.plugin.currentLocation();
-    const size = contentEl.createEl("p", { text: `Current repository: ${current.owner}/${current.repo} – size: loading…` });
+    const size = contentEl.createEl("p", { text: `Current location: ${describeLocation(current)} – size: loading…` });
     void this.plugin
       .repositorySize(true)
-      .then((bytes) => size.setText(`Current repository: ${current.owner}/${current.repo} – size: ${bytes === null ? "unknown" : formatBytes(bytes)}`))
-      .catch(() => size.setText(`Current repository: ${current.owner}/${current.repo} – size: unknown`));
+      .then((bytes) => size.setText(`Current location: ${describeLocation(current)} – size: ${bytes === null ? "unknown" : formatBytes(bytes)}`))
+      .catch(() => size.setText(`Current location: ${describeLocation(current)} – size: unknown`));
     const list = contentEl.createEl("ul");
     for (const line of [
       "Git keeps every version forever, so the repository only grows. This copies the current state of all files (verified and re-encrypted) into a new, empty repository.",
@@ -73,7 +79,7 @@ export class MoveVaultModal extends Modal {
     this.contentEl.empty();
   }
 
-  private update(change: Partial<RepoLocation>): void {
+  private update(change: Partial<GitHubTarget>): void {
     this.target = { ...this.target, ...change };
     this.state = null;
     this.moveButton?.setDisabled(true);
@@ -81,10 +87,15 @@ export class MoveVaultModal extends Modal {
     this.statusEl?.setText("Check the new repository first.");
   }
 
+  /** The entered target as a validated location (throws on invalid names). */
+  private location(): BackendLocation {
+    return parseBackendLocation({ kind: "github", ...this.target }, "target");
+  }
+
   private async check(): Promise<void> {
     this.statusEl?.setText("Checking…");
     try {
-      const result = await this.plugin.inspectMoveTarget(this.target);
+      const result = await this.plugin.inspectMoveTarget(this.location());
       this.state = result.state;
       this.isPrivate = result.isPrivate;
       const visibility = result.state === "missing" ? "" : result.isPrivate ? " (private)" : " ⚠ This repository is PUBLIC: everyone can see its encrypted data and metadata (file count, sizes, change times).";
@@ -98,7 +109,7 @@ export class MoveVaultModal extends Modal {
 
   private async create(): Promise<void> {
     try {
-      await this.plugin.createMoveTarget(this.target);
+      await this.plugin.createMoveTarget(this.location());
       new Notice(`Private repository ${this.target.owner}/${this.target.repo} created.`);
       await this.check();
     } catch (error: unknown) {
@@ -131,7 +142,7 @@ export class MoveVaultModal extends Modal {
     const progress = contentEl.createEl("progress", { cls: "encrypted-sync-progress" });
     const label = contentEl.createEl("p", { text: "Synchronising first…" });
     try {
-      const copied = await this.plugin.moveToRepository(t, (done, total) => {
+      const copied = await this.plugin.moveToRepository(this.location(), (done, total) => {
         progress.max = Math.max(1, total);
         progress.value = done;
         label.setText(`${done} / ${total} files copied`);

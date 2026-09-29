@@ -1,7 +1,7 @@
-import { GitHubError, type RemoteErrorCategory } from "../errors/GitHubError";
+import { RemoteError, type RemoteErrorCategory } from "../errors/RemoteError";
 import { silentLogger, type Logger } from "../util/Logger";
 import type { AuthProvider } from "./GitHubAuth";
-import { responseJson, type HttpClient, type HttpRequest, type HttpResponse } from "./HttpClient";
+import { responseJson, type HttpClient, type HttpRequest, type HttpResponse } from "../net/HttpClient";
 
 export interface GitHubClientOptions {
   readonly http: HttpClient;
@@ -70,7 +70,7 @@ export class GitHubClient {
     try {
       return { status: response.status, data: responseJson(response) as T };
     } catch (error: unknown) {
-      throw new GitHubError("InvalidResponse", response.status, null, { cause: error });
+      throw new RemoteError("InvalidResponse", response.status, null, { cause: error });
     }
   }
 
@@ -106,7 +106,7 @@ export class GitHubClient {
           await this.sleep(this.backoff(attempt));
           continue;
         }
-        throw new GitHubError("Network", null, null, { cause: error instanceof Error ? new Error(error.name) : undefined });
+        throw new RemoteError("Network", null, null, { cause: error instanceof Error ? new Error(error.name) : undefined });
       }
 
       this.trackRateLimit(response);
@@ -120,13 +120,13 @@ export class GitHubClient {
           await this.sleep(retryAfter);
           continue;
         }
-        throw new GitHubError("RateLimit", response.status, retryAfter);
+        throw new RemoteError("RateLimit", response.status, retryAfter);
       }
       if (category === "ServerError" && (retryable || response.status === 502 || response.status === 503) && attempt < this.maxRetries) {
         await this.sleep(this.backoff(attempt));
         continue;
       }
-      throw new GitHubError(category, response.status);
+      throw new RemoteError(category, response.status);
     }
   }
 
@@ -139,7 +139,7 @@ export class GitHubClient {
   private async respectRateLimit(): Promise<void> {
     const wait = this.rateLimitedUntil - this.now();
     if (wait <= 0) return;
-    if (wait > this.maxRateLimitWaitMs) throw new GitHubError("RateLimit", null, wait);
+    if (wait > this.maxRateLimitWaitMs) throw new RemoteError("RateLimit", null, wait);
     await this.sleep(wait);
   }
 

@@ -3,7 +3,7 @@
  * contain secrets, file contents or (unless explicitly allowed) file paths.
  */
 export abstract class VaultSyncError extends Error {
-  abstract readonly domain: "crypto" | "github" | "sync" | "vault" | "state" | "format";
+  abstract readonly domain: "crypto" | "remote" | "sync" | "vault" | "state" | "format";
 
   constructor(message: string, options?: { cause?: unknown }) {
     super(message);

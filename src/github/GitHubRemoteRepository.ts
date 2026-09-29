@@ -1,4 +1,4 @@
-import { GitHubError } from "../errors/GitHubError";
+import { RemoteError } from "../errors/RemoteError";
 import { SyncError } from "../errors/SyncError";
 import { serializeVaultConfig, type PublicVaultConfig } from "../manifest/VaultConfig";
 import { armor, assertEncrypted, CONFIG_PATH, isMigrationMessage, MANIFEST_PATH, objectIdFromPath, objectPath, parseCommitDevice, unarmor } from "../remote/RemoteLayout";
@@ -43,7 +43,7 @@ export class GitHubRemoteRepository implements RemoteRepository {
     if (head === "empty") return { kind: "empty" };
     if (head !== null) return { kind: "ok", commit: head };
     const repo = await this.api.getRepository();
-    if (!repo.exists) throw new GitHubError("RepositoryMissing", 404);
+    if (!repo.exists) throw new RemoteError("RepositoryMissing", 404);
     return (await this.api.hasAnyBranch()) ? { kind: "branchMissing" } : { kind: "empty" };
   }
 
@@ -58,7 +58,7 @@ export class GitHubRemoteRepository implements RemoteRepository {
 
   async readObject(commit: string, objectId: string): Promise<Uint8Array> {
     const stored = await this.api.getFileRaw(commit, objectPath(objectId));
-    if (!stored) throw new GitHubError("NotFound", 404);
+    if (!stored) throw new RemoteError("NotFound", 404);
     return unarmor(stored);
   }
 
@@ -125,7 +125,7 @@ export class GitHubRemoteRepository implements RemoteRepository {
           break;
         }
         case "putUploadedObject":
-          if (!GIT_SHA.test(change.handle)) throw new GitHubError("InvalidResponse");
+          if (!GIT_SHA.test(change.handle)) throw new RemoteError("InvalidResponse");
           entries.push({ path: objectPath(change.objectId), mode: "100644", type: "blob", sha: change.handle, inlineBytes: 0 });
           break;
         case "deleteObject":
@@ -171,7 +171,7 @@ export class GitHubRemoteRepository implements RemoteRepository {
       accepted = await this.api.updateBranch(this.branch, newCommit);
     } catch (error: unknown) {
       // Outcome unknown (e.g. connection dropped): look at the branch to decide.
-      if (!(error instanceof GitHubError) || error.category !== "Network") throw error;
+      if (!(error instanceof RemoteError) || error.category !== "Network") throw error;
       const after = await this.api.getBranchHead(this.branch);
       if (after === expectedParent) throw error;
       if (await this.landed(newCommit, after)) return;

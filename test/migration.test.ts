@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { SyncError } from "../src/errors/SyncError";
-import { isLive, type RepoLocation } from "../src/manifest/Manifest";
+import { isLive } from "../src/manifest/Manifest";
+import type { BackendLocation } from "../src/remote/BackendLocation";
 import { CONFIG_PATH } from "../src/remote/RemoteLayout";
 import { DeletedFiles } from "../src/sync/DeletedFiles";
 import { readVerifiedHead } from "../src/sync/HistoryReader";
@@ -16,8 +17,8 @@ import { GitHubRemoteRepository } from "../src/github/GitHubRemoteRepository";
 import { crypto, Device, twoDevices } from "./fakes/harness";
 import { findLeaks } from "./security.test";
 
-const OLD: RepoLocation = { owner: "alice", repo: "vault", branch: "main" };
-const NEW: RepoLocation = { owner: "alice", repo: "vault-2", branch: "main" };
+const OLD: BackendLocation = { kind: "github", owner: "alice", repo: "vault", branch: "main" };
+const NEW: BackendLocation = { kind: "github", owner: "alice", repo: "vault-2", branch: "main" };
 
 function move(d: Device, target: FakeRemoteRepository, extra: Partial<MoveOptions> = {}) {
   return moveVault({ crypto, keys: d.keys, store: d.store, deviceId: d.deviceId, source: d.remote, sourceLocation: OLD, target, targetLocation: NEW, ...extra });
@@ -190,7 +191,7 @@ describe("moving a vault to a new repository", () => {
     const second = new FakeRemoteRepository();
     const third = new FakeRemoteRepository();
     const SECOND = NEW;
-    const THIRD: RepoLocation = { owner: "alice", repo: "vault-3", branch: "main" };
+    const THIRD: BackendLocation = { kind: "github", owner: "alice", repo: "vault-3", branch: "main" };
     await move(a, second);
     a.switchRemote(second);
     await moveVault({ crypto, keys: a.keys, store: a.store, deviceId: a.deviceId, source: second, sourceLocation: SECOND, target: third, targetLocation: THIRD });

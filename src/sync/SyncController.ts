@@ -1,5 +1,5 @@
 import { CryptoError } from "../errors/CryptoError";
-import { GitHubError } from "../errors/GitHubError";
+import { RemoteError } from "../errors/RemoteError";
 import { SyncError } from "../errors/SyncError";
 import { describeError } from "../errors/VaultSyncError";
 import { silentLogger, type Logger } from "../util/Logger";
@@ -221,7 +221,7 @@ export class SyncController {
       this.setStatus({ state: "locked", message });
       return;
     }
-    if (error instanceof GitHubError) {
+    if (error instanceof RemoteError) {
       if (error.category === "Network" || error.category === "ServerError") {
         this.setStatus({ state: "offline", message });
         this.scheduleRetry();

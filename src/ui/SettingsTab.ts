@@ -9,6 +9,7 @@ import { MAX_VERSION_LIMIT } from "../sync/VersionHistory";
 import { IGNORE_FILE } from "../vault/SyncFilter";
 import { confirmDialog, formatBytes, promptVaultSecret } from "./Modals";
 import { SetupWizard } from "./SetupWizard";
+import { describeLocation } from "../remote/BackendLocation";
 import { statusText } from "./StatusBar";
 
 export class SettingsTab extends PluginSettingTab {
@@ -61,38 +62,47 @@ export class SettingsTab extends PluginSettingTab {
       })
       .addButton((b) => b.setButtonText("Details").onClick(() => this.plugin.openStatus()));
 
-    // ── GitHub ──
-    new Setting(containerEl).setName("GitHub").setHeading();
+    // ── Storage ──
+    new Setting(containerEl).setName("Storage").setHeading();
     new Setting(containerEl)
-      .setName("Repository")
-      .setDesc(s.owner && s.repo ? `${s.owner}/${s.repo} (branch ${s.branch})` : "Not configured")
+      .setName("Location")
+      .setDesc(s.location ? describeLocation(s.location) : "Not configured")
       .addButton((b) => b.setButtonText(this.plugin.isConfigured() ? "Change / reconnect" : "Set up").setCta().onClick(() => new SetupWizard(this.app, this.plugin).open()));
-    new Setting(containerEl)
-      .setName("Access token")
-      .setDesc(this.plugin.secrets.persistent ? "Stored in the system keychain (never in data.json or the vault)." : "Secret storage unavailable: the token is kept in memory only for this session.")
-      .addText((t) => {
-        t.inputEl.type = "password";
-        t.setPlaceholder(this.plugin.getToken() ? "•••••••• (stored)" : "github_pat_…");
-        t.inputEl.addEventListener("change", () => {
-          if (t.getValue()) {
-            this.plugin.setToken(t.getValue());
-            t.setValue("");
-            new Notice("Token saved.");
-            this.display();
-          }
+    if (s.location?.kind === "github") {
+      const location = s.location;
+      new Setting(containerEl)
+        .setName("Access token")
+        .setDesc(this.plugin.secrets.persistent ? "Stored in the system keychain (never in data.json or the vault)." : "Secret storage unavailable: the token is kept in memory only for this session.")
+        .addText((t) => {
+          t.inputEl.type = "password";
+          t.setPlaceholder(this.plugin.getCredentials() ? "•••••••• (stored)" : "github_pat_…");
+          t.inputEl.addEventListener("change", () => {
+            if (t.getValue()) {
+              this.plugin.setCredentials(location, { kind: "github", token: t.getValue().trim() });
+              t.setValue("");
+              new Notice("Token saved.");
+              this.display();
+            }
+          });
         });
-      });
+    }
     new Setting(containerEl).setName("Test connection").addButton((b) =>
       b.setButtonText("Test").onClick(async () => {
-        const token = this.plugin.getToken();
-        if (!s.owner || !s.repo || !token) {
-          new Notice("Repository or token missing.");
+        const location = s.location;
+        const credentials = this.plugin.getCredentials();
+        if (!location || !credentials) {
+          new Notice("Location or credentials missing.");
           return;
         }
         try {
-          const result = await this.plugin.inspect(s.owner, s.repo, s.branch, token);
+          const result = await this.plugin.inspect(location, credentials);
+          if (result.check.access === "missing") {
+            new Notice("The location does not exist or the credentials cannot access it.", 8000);
+            return;
+          }
           const kind = result.inspection.kind === "vault" ? "encrypted vault found" : result.inspection.kind === "uninitialized" ? "empty (can be initialised)" : "contains foreign files";
-          new Notice(`Connection OK · ${result.canPush ? "write access" : "NO write access"} · ${result.isPrivate ? "private" : "PUBLIC"} · ${kind}`, 8000);
+          const visibility = result.check.isPrivate === null ? "" : result.check.isPrivate ? " · private" : " · PUBLIC";
+          new Notice(`Connection OK · ${result.check.writable ? "write access" : "NO write access"}${visibility} · ${kind}`, 8000);
         } catch (error: unknown) {
           new Notice(`Connection failed: ${describeError(error)}`, 8000);
         }

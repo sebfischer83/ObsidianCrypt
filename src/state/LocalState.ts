@@ -1,5 +1,6 @@
-import type { Manifest, ManifestEntry, RepoLocation } from "../manifest/Manifest";
-import { parseManifestEntries, parseManifestObject, parseRepoLocation } from "../manifest/ManifestCodec";
+import type { Manifest, ManifestEntry } from "../manifest/Manifest";
+import { parseBackendLocation, type BackendLocation } from "../remote/BackendLocation";
+import { parseManifestEntries, parseManifestObject } from "../manifest/ManifestCodec";
 import {
   expectArray,
   expectInteger,
@@ -107,15 +108,13 @@ export interface PendingCommit {
 }
 
 export interface PendingSwitch {
-  readonly location: RepoLocation;
+  readonly location: BackendLocation;
   readonly commit: string;
   readonly manifest: Manifest;
 }
 
-export interface MovedTo extends RepoLocation {
-  /** Commit of the old repository that carries the marker. */
-  readonly markerCommit: string;
-}
+/** The announced new location plus the commit of the old repository that carries the marker. */
+export type MovedTo = BackendLocation & { readonly markerCommit: string };
 
 export interface LocalState {
   readonly stateVersion: 1;
@@ -215,10 +214,10 @@ export function parseLocalState(raw: unknown): LocalState {
     journal,
     pendingCommit,
     conflicts: expectArray(r.conflicts, "state.conflicts").map((c) => parseConflict(c)),
-    movedTo: isRecord(r.movedTo) ? { ...parseRepoLocation({ owner: r.movedTo.owner, repo: r.movedTo.repo, branch: r.movedTo.branch }, "state.movedTo"), markerCommit: expectString(r.movedTo.markerCommit, "state.movedTo.markerCommit", GIT_SHA) } : null,
+    movedTo: isRecord(r.movedTo) ? parseMovedTo(r.movedTo) : null,
     pendingSwitch: isRecord(r.pendingSwitch)
       ? {
-          location: parseRepoLocation(r.pendingSwitch.location, "state.pendingSwitch.location"),
+          location: parseBackendLocation(r.pendingSwitch.location, "state.pendingSwitch.location", true),
           commit: expectString(r.pendingSwitch.commit, "state.pendingSwitch.commit", GIT_SHA),
           manifest: parseManifestObject(r.pendingSwitch.manifest, vaultId ?? ""),
         }
@@ -296,4 +295,9 @@ function parseOp(raw: unknown): LocalOp {
     default:
       throw new ValidationError("op.op", "unknown op");
   }
+}
+
+function parseMovedTo(raw: Record<string, unknown>): MovedTo {
+  const { markerCommit, ...location } = raw;
+  return { ...parseBackendLocation(location, "state.movedTo", true), markerCommit: expectString(markerCommit, "state.movedTo.markerCommit", GIT_SHA) };
 }

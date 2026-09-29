@@ -77,7 +77,7 @@ describe("manifest", () => {
   it("rejects unknown fields, foreign vaults and newer formats", () => {
     expectBlocked(() => decodeManifest(utf8Encode(JSON.stringify({ ...sample(), extra: 1 })), VAULT), "ManifestCorrupted");
     expectBlocked(() => decodeManifest(encodeManifest(sample()), "f".repeat(32)), "ForeignVault");
-    expectBlocked(() => decodeManifest(utf8Encode(JSON.stringify({ ...sample(), formatVersion: 5 })), VAULT), "UnknownFormatVersion");
+    expectBlocked(() => decodeManifest(utf8Encode(JSON.stringify({ ...sample(), formatVersion: 6 })), VAULT), "UnknownFormatVersion");
     expectBlocked(() => decodeManifest(utf8Encode("not json"), VAULT), "ManifestCorrupted");
   });
 

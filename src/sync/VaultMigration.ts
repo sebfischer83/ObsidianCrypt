@@ -2,19 +2,18 @@ import type { CryptoProvider } from "../crypto/CryptoProvider";
 import { EncryptionEngine } from "../crypto/EncryptionEngine";
 import type { VaultKeys } from "../crypto/KeyManager";
 import { CryptoError } from "../errors/CryptoError";
-import { GitHubError } from "../errors/GitHubError";
+import { RemoteError } from "../errors/RemoteError";
 import { SyncError } from "../errors/SyncError";
 import {
 
   isLive,
   MANIFEST_TYPE,
   MANIFEST_FORMAT_VERSION,
-  type ArchivedRepo,
   type Manifest,
   type ManifestEntry,
-  type RepoLocation,
 } from "../manifest/Manifest";
 import { decodeManifest, encodeManifest } from "../manifest/ManifestCodec";
+import { sameLocation, toLocation, type ArchivedLocation, type BackendLocation } from "../remote/BackendLocation";
 import { buildMigrationMessage, buildMovedMessage } from "../remote/RemoteLayout";
 import type { RemoteChange, RemoteRepository } from "../remote/RemoteRepository";
 import type { LocalState } from "../state/LocalState";
@@ -44,9 +43,9 @@ export interface MoveOptions {
   readonly store: SyncStateStore;
   readonly deviceId: string;
   readonly source: RemoteRepository;
-  readonly sourceLocation: RepoLocation;
+  readonly sourceLocation: BackendLocation;
   readonly target: RemoteRepository;
-  readonly targetLocation: RepoLocation;
+  readonly targetLocation: BackendLocation;
   readonly limits?: { readonly maxFilesPerCommit?: number; readonly maxBytesPerCommit?: number; readonly chunkSize?: number };
   readonly onProgress?: (done: number, total: number) => void;
   readonly now?: () => number;
@@ -84,7 +83,7 @@ export async function moveVault(o: MoveOptions): Promise<MoveResult> {
   const target = await readVerifiedHead(o.target, o.crypto, o.keys, o.deviceId);
   if (target.manifest.movedTo) throw new SyncError("InvalidState", "the new repository was itself retired");
 
-  const archive: ArchivedRepo = { ...o.sourceLocation, commit: source.commit };
+  const archive: ArchivedLocation = { ...toLocation(o.sourceLocation), commit: source.commit };
   const movedFrom = [archive, ...(source.manifest.movedFrom ?? []).filter((a) => !sameLocation(a, archive))];
   const mirrored = await mirror(o, source, target, movedFrom);
 
@@ -124,7 +123,7 @@ export async function followMove(o: {
   store: SyncStateStore;
   deviceId: string;
   /** Repository this device synchronised with so far (the one that carries the marker). */
-  sourceLocation: RepoLocation;
+  sourceLocation: BackendLocation;
   target: RemoteRepository;
 }): Promise<void> {
   const state = o.store.state;
@@ -136,11 +135,11 @@ export async function followMove(o: {
   // The new repository must name the old one as its predecessor (it was created by the move).
   if (!(head.manifest.movedFrom ?? []).some((a) => sameLocation(a, o.sourceLocation))) throw new SyncError("InvalidState", "the new repository does not continue this vault");
   if (head.manifest.version <= state.lastManifestVersion) throw SyncError.blocked("HistoryRewritten");
-  recordSwitch(state, { owner: moved.owner, repo: moved.repo, branch: moved.branch }, head);
+  recordSwitch(state, toLocation(moved), head);
   await o.store.persist();
 }
 
-function recordSwitch(state: LocalState, location: RepoLocation, head: VerifiedHead): void {
+function recordSwitch(state: LocalState, location: BackendLocation, head: VerifiedHead): void {
   state.pendingSwitch = { location, commit: head.commit, manifest: head.manifest };
 }
 
@@ -159,11 +158,7 @@ export function completeSwitch(state: LocalState): void {
   state.pendingSwitch = null;
 }
 
-export function sameLocation(a: RepoLocation, b: RepoLocation): boolean {
-  return a.owner.toLowerCase() === b.owner.toLowerCase() && a.repo.toLowerCase() === b.repo.toLowerCase() && a.branch === b.branch;
-}
-
-async function mirror(o: MoveOptions, source: VerifiedHead, target: VerifiedHead, movedFrom: ArchivedRepo[]): Promise<{ head: VerifiedHead; copied: number }> {
+async function mirror(o: MoveOptions, source: VerifiedHead, target: VerifiedHead, movedFrom: ArchivedLocation[]): Promise<{ head: VerifiedHead; copied: number }> {
   const engine = new EncryptionEngine(o.crypto, o.keys);
   const maxFiles = o.limits?.maxFilesPerCommit ?? DEFAULT_LIMITS.maxFilesPerCommit;
   const maxBytes = o.limits?.maxBytesPerCommit ?? DEFAULT_LIMITS.maxBytesPerCommit;
@@ -199,7 +194,7 @@ async function mirror(o: MoveOptions, source: VerifiedHead, target: VerifiedHead
     try {
       (await readObjectContent(o.target, engine, target.commit, id, w.contentHash, Math.min(w.size, HARD_MAX_FILE_SIZE))).fill(0);
     } catch (error: unknown) {
-      if (!(error instanceof GitHubError && error.category === "NotFound") && !(error instanceof CryptoError)) throw error;
+      if (!(error instanceof RemoteError && error.category === "NotFound") && !(error instanceof CryptoError)) throw error;
       delete entries[id];
       toCopy.push(id);
     }

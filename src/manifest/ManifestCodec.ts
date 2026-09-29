@@ -15,7 +15,8 @@ import {
   ValidationError,
 } from "../util/validate";
 import { isValidVaultPath, pathKey } from "../vault/PathUtils";
-import { CONFIG_HASH_FORMAT_VERSION, MANIFEST_TYPE, MAX_MANIFEST_FORMAT_VERSION, MOVE_FORMAT_VERSION, type ArchivedRepo, type Manifest, type ManifestEntry, type RepoLocation } from "./Manifest";
+import { CONFIG_HASH_FORMAT_VERSION, LOCATION_KIND_FORMAT_VERSION, MANIFEST_TYPE, MAX_MANIFEST_FORMAT_VERSION, MOVE_FORMAT_VERSION, type Manifest, type ManifestEntry } from "./Manifest";
+import { parseArchivedLocation, parseBackendLocation } from "../remote/BackendLocation";
 
 export const MAX_MANIFEST_ENTRIES = 1_000_000;
 /** Upper bound for the chunk count of one file (far above HARD_MAX_FILE_SIZE / chunk size). */
@@ -84,35 +85,18 @@ export function parseManifestObject(raw: unknown, expectedVaultId: string): Mani
     updatedAt: expectInteger(record.updatedAt, "manifest.updatedAt", 0),
     entries,
   };
-  const movedTo = record.movedTo === undefined ? undefined : parseRepoLocation(record.movedTo, "manifest.movedTo");
+  // Before format 5, locations were GitHub-only and had no `kind`.
+  const legacyLocations = formatVersion < LOCATION_KIND_FORMAT_VERSION;
+  const movedTo = record.movedTo === undefined ? undefined : parseBackendLocation(record.movedTo, "manifest.movedTo", legacyLocations);
   const movedFrom =
     record.movedFrom === undefined
       ? undefined
-      : expectArray(record.movedFrom, "manifest.movedFrom").map((value, i): ArchivedRepo => {
-          const r = expectRecord(value, `manifest.movedFrom.${i}`);
-          expectOnlyKeys(r, ["owner", "repo", "branch", "commit"], `manifest.movedFrom.${i}`);
-          return { ...parseRepoLocation({ owner: r.owner, repo: r.repo, branch: r.branch }, `manifest.movedFrom.${i}`), commit: expectString(r.commit, `manifest.movedFrom.${i}.commit`, GIT_SHA) };
-        });
+      : expectArray(record.movedFrom, "manifest.movedFrom").map((value, i) => parseArchivedLocation(value, `manifest.movedFrom.${i}`, legacyLocations));
   if (movedFrom && movedFrom.length > 100) throw new ValidationError("manifest.movedFrom", "too many archives");
   const configHash = record.configHash === undefined ? undefined : expectString(record.configHash, "manifest.configHash", HEX_64);
   if (formatVersion >= CONFIG_HASH_FORMAT_VERSION && configHash === undefined) throw new ValidationError("manifest.configHash", "missing");
   if (configHash !== undefined && formatVersion < CONFIG_HASH_FORMAT_VERSION) throw new ValidationError("manifest.configHash", "needs format 4");
   return { ...manifest, ...(movedTo ? { movedTo } : {}), ...(movedFrom ? { movedFrom } : {}), ...(configHash ? { configHash } : {}) };
-}
-
-const OWNER = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/;
-const REPO = /^[A-Za-z0-9._-]{1,100}$/;
-const BRANCH = /^[A-Za-z0-9._/-]{1,250}$/;
-
-/** A GitHub repository location (strict: it is used to build API URLs). */
-export function parseRepoLocation(value: unknown, field: string): RepoLocation {
-  const r = expectRecord(value, field);
-  expectOnlyKeys(r, ["owner", "repo", "branch"], field);
-  const owner = expectString(r.owner, `${field}.owner`, OWNER);
-  const repo = expectString(r.repo, `${field}.repo`, REPO);
-  const branch = expectString(r.branch, `${field}.branch`, BRANCH);
-  if (repo === "." || repo === ".." || branch.includes("..")) throw new ValidationError(field, "invalid location");
-  return { owner, repo, branch };
 }
 
 /** Parses a record of entries without cross-entry checks (used for the per-object merge base). */

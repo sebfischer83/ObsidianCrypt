@@ -1,6 +1,6 @@
 import type { CryptoProvider } from "../crypto/CryptoProvider";
 import { CryptoError } from "../errors/CryptoError";
-import { GitHubError } from "../errors/GitHubError";
+import { RemoteError } from "../errors/RemoteError";
 import { SyncError } from "../errors/SyncError";
 import { VaultSyncError } from "../errors/VaultSyncError";
 import type { LocalOp } from "../state/LocalState";
@@ -73,7 +73,7 @@ export async function applyLocalOps(ops: readonly LocalOp[], ctx: ApplyContext):
       else markFailed(i, op, "diverged");
     } catch (error: unknown) {
       // Network/auth/rate-limit problems abort the whole apply; the journal is resumed on the next run.
-      if (error instanceof GitHubError && error.category !== "NotFound") throw error;
+      if (error instanceof RemoteError && error.category !== "NotFound") throw error;
       // The vault was locked (plugin unloading or user action): stop, the journal resumes later.
       if (error instanceof CryptoError && error.code === "Locked") throw error;
       if (error instanceof VaultSyncError) markFailed(i, op, "error", error);

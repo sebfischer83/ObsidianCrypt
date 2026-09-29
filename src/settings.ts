@@ -3,15 +3,15 @@ import { DEFAULT_LIMITS, HARD_MAX_FILE_SIZE } from "./sync/SyncEngine";
 import type { TriggerSettings } from "./sync/SyncController";
 import { MAX_VERSION_LIMIT } from "./sync/VersionHistory";
 import { isRecord } from "./util/validate";
+import { parseBackendLocation, type BackendLocation } from "./remote/BackendLocation";
 
 /**
  * Plugin settings stored in data.json. MUST NOT contain secrets (token, password, keys): those live in
  * the SecretStore only.
  */
 export interface PluginSettings extends TriggerSettings {
-  owner: string;
-  repo: string;
-  branch: string;
+  /** Where the vault is stored (GitHub repository, S3 bucket/prefix, WebDAV folder); null = not set up. */
+  location: BackendLocation | null;
   autoSync: boolean;
   syncOnStartup: boolean;
   syncOnResume: boolean;
@@ -37,9 +37,7 @@ export interface PluginSettings extends TriggerSettings {
 }
 
 export const DEFAULT_SETTINGS: PluginSettings = {
-  owner: "",
-  repo: "",
-  branch: "main",
+  location: null,
   autoSync: true,
   syncOnStartup: true,
   syncOnResume: true,
@@ -67,9 +65,11 @@ export function loadSettings(raw: unknown): PluginSettings {
   const settings: PluginSettings = { ...DEFAULT_SETTINGS };
   if (!isRecord(raw)) return settings;
   for (const key of Object.keys(DEFAULT_SETTINGS) as Array<keyof PluginSettings>) {
+    if (key === "location") continue;
     const value = raw[key];
     if (typeof value === typeof DEFAULT_SETTINGS[key]) (settings as unknown as Record<string, unknown>)[key] = value;
   }
+  settings.location = loadLocation(raw);
   settings.debounceSeconds = clamp(settings.debounceSeconds, 5, 3600);
   settings.intervalMinutes = settings.intervalMinutes === 0 ? 0 : clamp(settings.intervalMinutes, 1, 60);
   settings.maxFileSizeMB = clamp(settings.maxFileSizeMB, 1, MAX_FILE_SIZE_MB_LIMIT);
@@ -81,4 +81,17 @@ export function loadSettings(raw: unknown): PluginSettings {
 function clamp(value: number, min: number, max: number): number {
   if (!Number.isFinite(value)) return min;
   return Math.min(max, Math.max(min, Math.round(value)));
+}
+
+/** The stored location, strictly validated; settings of 0.4 and earlier stored a GitHub owner/repo/branch. */
+function loadLocation(raw: Record<string, unknown>): BackendLocation | null {
+  try {
+    if (raw.location !== undefined && raw.location !== null) return parseBackendLocation(raw.location, "settings.location");
+    if (typeof raw.owner === "string" && raw.owner && typeof raw.repo === "string" && raw.repo) {
+      return parseBackendLocation({ kind: "github", owner: raw.owner, repo: raw.repo, branch: typeof raw.branch === "string" && raw.branch ? raw.branch : "main" }, "settings");
+    }
+  } catch {
+    // An invalid stored location is treated as "not set up" (never guessed).
+  }
+  return null;
 }

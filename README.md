@@ -1,162 +1,353 @@
-# Encrypted GitHub Sync for Obsidian
+<div align="center">
 
-End-to-end encrypted synchronisation of an Obsidian vault with a GitHub repository – on Windows, macOS,
-Linux, iOS and Android. Your vault stays a normal Obsidian vault; GitHub only ever receives encrypted
-objects with random names.
+# 🔐 Encrypted GitHub Sync for Obsidian
 
-> **Status:** Version 0.1 – core, GitHub backend and UI are implemented and covered by automated tests
-> (see below). Manual testing on real iOS/Android devices (phase 7) is still outstanding.
+**End-to-end encrypted sync of your Obsidian vault – your notes never leave your device unencrypted.**
 
-## What GitHub can and cannot see
+[![Release](https://img.shields.io/github/v/release/sebfischer83/ObsidianCrypt?label=release)](https://github.com/sebfischer83/ObsidianCrypt/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+![Platforms](https://img.shields.io/badge/platforms-Windows%20%7C%20macOS%20%7C%20Linux%20%7C%20iOS%20%7C%20Android-6c5ce7)
+![Encryption](https://img.shields.io/badge/encryption-AES--256--GCM%20%2B%20Argon2id-2d9d5b)
+![Tests](https://img.shields.io/badge/tests-2%2C200%2B%20incl.%20fuzzing-2d9d5b)
+
+</div>
+
+Your vault stays a normal Obsidian vault on every device. Before anything is uploaded, contents, **file names and
+folder names** are encrypted on your device. GitHub only ever stores encrypted objects with random names – it never
+sees what you write, what your notes are called or how your vault is organised.
+
+> **Status: beta.** Everything below is implemented and covered by automated tests (unit, integration, a GitHub API
+> emulator, security scans and randomised multi-device sessions). Manual testing on real iOS/Android devices is still
+> in progress – keep a backup of your vault while trying it out.
+
+---
+
+## Contents
+
+- [Highlights](#-highlights)
+- [How it works](#-how-it-works)
+- [What GitHub can and cannot see](#-what-github-can-and-cannot-see)
+- [Installation](#-installation)
+- [Setup](#-setup)
+- [Everyday use](#-everyday-use)
+- [Features in detail](#-features-in-detail)
+- [Security](#-security)
+- [Limits](#-limits)
+- [Roadmap: more storage backends](#-roadmap-more-storage-backends)
+- [FAQ](#-faq)
+- [Development](#-development)
+
+---
+
+## ✨ Highlights
+
+- 🔒 **Zero-knowledge encryption** – AES-256-GCM for every file and the file list, keys derived with Argon2id.
+- 🙈 **Names are hidden too** – no file names, folder names or paths ever reach GitHub.
+- 🛟 **Data-loss-first design** – nothing is ever overwritten or deleted without the previous state being recoverable;
+  conflicts keep both versions; remote deletions go to the trash.
+- 🕰️ **Version history** – restore any earlier version of a note, from any device.
+- 🗑️ **Restore deleted files** – even ones deleted on another device, weeks ago.
+- ⚔️ **Conflict resolution with diff** – compare both versions side by side and decide.
+- 📦 **Large files** – up to 256 MB, uploaded as encrypted chunks; only changed chunks are re-uploaded.
+- 🧭 **Sync status in the file explorer** – see at a glance what is pending, conflicting or excluded.
+- 🔍 **Verify repository** – check that every file on GitHub decrypts correctly.
+- 🚚 **Move to a fresh repository** – shrink an ever-growing history without deleting anything.
+- 📱 **Desktop and mobile** – Windows, macOS, Linux, iOS and Android, no external tools, no git installation.
+- 🚫 **No servers, no telemetry** – the plugin talks only to the GitHub API of the repository you choose.
+
+---
+
+## ⚙️ How it works
+
+```
+ Your device                                             GitHub (private repository)
+┌──────────────────────────────┐                        ┌──────────────────────────────────┐
+│ Notes/Projects/Plan.md       │   encrypt locally      │ .vaultsync/config   (public      │
+│ Journal/2026-09-28.md        │  ───────────────────►  │                      parameters) │
+│ Attachments/photo.jpg        │   AES-256-GCM          │ .vaultsync/manifest.enc          │
+│                              │                        │ objects/3a/3a9f…c1   (encrypted) │
+│ your password ─► Argon2id    │  ◄───────────────────  │ objects/b7/b70e…42   (encrypted) │
+│             ─► vault key     │   verify + decrypt     │ …                                │
+└──────────────────────────────┘                        └──────────────────────────────────┘
+```
+
+- A random **256-bit vault key** encrypts everything. Your **password** (via Argon2id) and an optional
+  **recovery key** unlock it; the vault key itself never leaves your devices unencrypted.
+- The **manifest** (the encrypted list of files) maps random object ids to paths and content hashes.
+- Every sync is a **git commit** made through the GitHub API. The branch is only ever fast-forwarded (never
+  force-pushed), so two devices pushing at once can never overwrite each other – the second one merges and retries.
+- A **three-way merge** (common base, local, remote) decides what changed where. When both sides changed the same
+  note, both versions are kept.
+
+---
+
+## 👀 What GitHub can and cannot see
 
 | GitHub **cannot** see | GitHub **can** see |
 |---|---|
-| File contents, file names, folder names | Number of encrypted objects and their approximate sizes |
-| Folder structure, content hashes, timestamps inside the vault | When and how often objects change (commit times) |
+| File contents | That this repository holds an encrypted vault |
+| File names, folder names, folder structure | How many encrypted objects there are and their approximate sizes |
+| Content hashes, timestamps inside the vault | When and how often objects change (commit times) |
 | Your password, vault key or recovery key | Random device ids in commit messages |
 
 Repository layout:
 
 ```
-.vaultsync/config         public parameters (vault id, KDF parameters, wrapped keys, MAC)
-.vaultsync/manifest.enc   encrypted mapping object id → path, size, hash
-objects/<aa>/<id>         encrypted files (AES-256-GCM)
+.vaultsync/config         public parameters (vault id, key-derivation parameters, wrapped keys, MAC)
+.vaultsync/manifest.enc   encrypted mapping: object id → path, size, content hash
+objects/<aa>/<id>         encrypted files (and encrypted chunks of large files)
 ```
 
-## Security model (short)
+---
 
-* Random 256-bit vault master key; your password protects it via **Argon2id** (64 MiB, t=3) – PBKDF2-SHA256
-  (600 000 iterations, WebCrypto) is available as alternative. Changing the password re-wraps only the key.
-* Optional **recovery key** (shown once, never stored; a new one requires the password).
-* **Changing the password or recovery key does not revoke the old one:** older commits in the repository history
-  still contain the old key slots. Anyone with the old secret and read access to the repository (or a copy) can
-  still decrypt it. Keep the repository private. After a leak, move the vault to a new repository and delete the old
-  one – this helps only as long as nobody has used the old secret yet; a real key rotation is not implemented.
-* Rollback protection: every manifest is bound to its parent commit and to the config, versions must increase,
-  and the history is followed through the encrypted parent links – not by trusting GitHub's answers.
-* Every file and the manifest are encrypted with **AES-256-GCM**, fresh random nonce, AAD binds each object to
-  its id and the vault. Manipulated data is rejected, never written into the vault.
-* The GitHub token and (optionally) the vault key are kept in Obsidian's **SecretStorage** (OS keychain),
-  never in `data.json` or the vault.
-* No telemetry, no analytics, no network traffic except to `api.github.com`.
+## 📥 Installation
 
-**If you lose both the password and the recovery key, your encrypted data cannot be recovered. There is no
-backdoor.**
+**Beta via BRAT (recommended):**
 
-Details: [docs/DESIGN.md](docs/DESIGN.md).
+1. Install the community plugin **BRAT**.
+2. Run *“BRAT: Add a beta plugin for testing”* and enter `sebfischer83/ObsidianCrypt`.
+3. Enable **Encrypted GitHub Sync** under *Settings → Community plugins*.
 
-## Disclosures
+**Manually:** download `main.js`, `manifest.json` and `styles.css` from the
+[latest release](https://github.com/sebfischer83/ObsidianCrypt/releases/latest) into
+`<vault>/.obsidian/plugins/encrypted-github-sync/` and enable the plugin.
 
-* **Network use:** the plugin talks only to the GitHub REST API (`https://api.github.com`) of the repository
-  you configure. Everything it sends is encrypted, except the public parameters in `.vaultsync/config`
-  (random vault id, key-derivation parameters, wrapped keys).
-* **Account required:** a GitHub account and a repository you can write to.
-* **No telemetry**, no analytics, no ads, no crash reports.
-* **Files outside the vault:** none. Local sync state is stored in the plugin folder; the GitHub token and
-  (optionally) the vault key are stored in Obsidian's secret storage (OS keychain).
+Requires **Obsidian 1.11.4** or newer. Don't sync the same vault with a second sync tool at the same time.
 
-## Installation
+---
 
-* **Beta via BRAT:** install the community plugin *BRAT*, run *“BRAT: Add a beta plugin for testing”* and
-  enter `sebfischer83/ObsidianCrypt`.
-* **Manually:** copy `main.js`, `manifest.json` and `styles.css` from the latest release into
-  `<vault>/.obsidian/plugins/encrypted-github-sync/` and enable the plugin under *Community plugins*.
+## 🚀 Setup
 
-Requires Obsidian 1.11.4 or newer. Do not use a second sync tool for the same vault at the same time.
+1. **Create an empty private repository** on GitHub.
+2. **Create a fine-grained personal access token:** *Repository access → Only select repositories →* your repository;
+   *Permissions → Contents: Read and write* (Metadata: read is added automatically).
+3. In Obsidian open *Settings → Encrypted GitHub Sync → Set up* and enter owner, repository, branch and token.
+4. **Choose a vault password** (at least 12 characters – a long passphrase is best). Review the summary
+   (“2,381 files · 1.7 GB will be encrypted and uploaded”) and **store the recovery key** somewhere safe.
+5. **On every further device:** install the plugin, enter the same repository and a token, then the vault password.
+   Existing local files are merged – nothing is deleted during the first sync.
 
-## Setup
+> ⚠️ **If you lose both the password and the recovery key, your data cannot be recovered – by anyone.** There is no
+> backdoor, by design.
 
-1. Create an **empty private** repository on GitHub.
-2. Create a **fine-grained personal access token**: *Repository access → Only select repositories →* your
-   repository; *Permissions → Contents: Read and write* (Metadata: read is added automatically).
-3. In Obsidian: *Settings → Encrypted GitHub Sync → Set up*, enter owner, repository, branch and token.
-4. Choose a vault password (≥ 12 characters), review the summary (“2,381 files · 1.7 GB will be encrypted and
-   uploaded”), store the recovery key.
-5. On further devices: install the plugin, enter the same repository and token, then the vault password.
-   Existing local files are merged; nothing is deleted during the first sync.
+---
 
-## Everyday use
+## 🗓️ Everyday use
 
-* Syncs on startup, ~30 s after the last change, on app resume and optionally every 1–60 minutes.
-* Commands: *Sync now*, *Pull from GitHub*, *Push to GitHub* (always pulls and merges first), *Show status*,
-  *Show conflicts*, *Lock vault*, *Unlock vault*, *Change password*, *Show version history of current note*,
-  *Restore deleted files*, *Show sync activity*, *Verify repository*, *Move vault to a new repository*.
-* Status bar: `☁ Synced`, `☁ 4 pending`, `↻ Syncing`, `☁ Offline · 37 pending`, `⚠ 2 conflicts`, `⚠ Sync error`.
-* **Conflicts** never lose data: if a note was changed on two devices, the remote version keeps the name and
-  your version is saved as `Note (conflict 2026-09-26 1a2b3c4d).md`. Delete-vs-modify always keeps the
-  modified version. Remote deletions move files to the vault’s `.trash` folder. *Compare* in the conflict list
-  shows a line diff of both versions: keep the synced version, keep your copy (the discarded one goes to the
-  trash, the replaced one stays in the version history) or open both side by side to merge manually.
-* **Version history** for Markdown notes: *Version history* in the file menu or the command *Show version
-  history of current note* lists earlier versions (setting *Versions per note*, 1–100, default 20), with
-  preview, *Restore* and *Restore as copy*. Versions are decrypted from the encrypted GitHub history – one
-  per sync that changed the note, from every device – so nothing extra is stored. Restoring never loses the
-  current content: unsynced changes are synced first (or the restore is refused and a copy can be made).
-* **Deleted files** (on any device) can be restored from the encrypted history: settings → *Deleted files* or
-  the command *Restore deleted files*. The file comes back at its old path, or as `Name (restored).ext` if that
-  name is taken – nothing is overwritten.
-* **Sync activity**: a local log of which files each sync downloaded, uploaded, moved or deleted, plus restores
-  and errors (status dialog → *Activity*). Stored only on this device.
-* **Verify repository** downloads and decrypts every file on GitHub and checks it against the encrypted
-  manifest (read-only; about one GitHub request per file).
-* **Large files** (over 4 MB) are uploaded as encrypted 4 MB chunks; after a change only the changed chunks are
-  uploaded again. Maximum file size is configurable up to 256 MB (default 50 MB).
-* **Sync status in the file explorer**: ● not synchronised yet, ⚠ conflict, ⊘ too large or unreadable, ◌ excluded
-  (folders show the most important mark of their contents). Can be turned off in the settings.
-* **Repository size and moving to a new repository**: the settings show the repository size (a hint appears
-  above 1 GB). *Move to a new repository* copies the current state of all files – verified and re-encrypted –
-  into a new empty private repository (it can be created for you) and continues there. The old repository is
-  kept untouched as an archive (version history and deleted files still reach into it). Other devices stop
-  syncing with the old repository and offer *Switch to new repository*; their unsynchronised changes are kept.
-  The access token needs access to the new repository on every device.
-* `.vaultsyncignore` (gitignore-like) excludes files before encryption. `.obsidian` sync is configurable
-  (core settings on by default; plugins, themes/snippets and workspace separately).
-* If the repository was manipulated (force-push, deleted branch, corrupted manifest, foreign vault, newer
-  format) synchronisation stops and your local files are left untouched.
+Sync runs on its own: on startup, about 30 seconds after your last change, when the app comes back to the foreground
+and – if you like – every 1–60 minutes.
 
-## Versions and formats
+| Status bar | Meaning |
+|---|---|
+| `☁ Synced` | Everything is up to date |
+| `☁ 4 pending` | Local changes waiting for the next sync |
+| `↻ Syncing` | A sync is running |
+| `☁ Offline · 37 pending` | No connection; changes are kept and synced later |
+| `⚠ 2 conflicts` | Two devices changed the same note – both versions are kept |
 
-All devices should run the same plugin version. Every upload writes the newest manifest format (currently 4); a
-device with an older plugin version stops with “The repository uses a newer format version. Please update the
-plugin.” and leaves its files untouched until it is updated.
+On mobile, where Obsidian has no status bar, the ribbon icon shows the state and opens the status dialog.
 
-## Limits
+**Commands** (command palette): *Sync now* · *Pull remote changes* · *Push local changes* (always merges first) · *Show status* · *Show conflicts* · *Show sync activity* ·
+*Show version history of current note* · *Restore deleted files* · *Verify repository* ·
+*Move vault to a new repository* · *Lock vault* · *Unlock vault* · *Change password* · *Set up / connect repository*
 
-* Files larger than the configured maximum (default 50 MB, hard limit 256 MB) are skipped and reported. Large
-  files are held in memory once while syncing, and every version stays in the repository history forever –
-  keep an eye on the repository size (GitHub recommends staying below a few GB).
-* Empty folders are not synchronised.
-* Two files whose names differ only by upper/lower case cannot both be synchronised (case-insensitive
-  file systems on Windows/macOS/iOS); the second one is reported and stays local.
-* GitHub limits content-creating requests; a very large first upload is split into several commits and may
-  take a while.
+---
 
-## Development
+## 🧩 Features in detail
+
+<details>
+<summary><b>⚔️ Conflicts – never lose a version</b></summary>
+
+- If a note was changed on two devices, the remote version keeps the name and yours is saved as
+  `Note (conflict 2026-09-26 1a2b3c4d).md`.
+- Changed on one device, deleted on the other? The changed version always survives.
+- **Compare** in the conflict list shows a line diff. Keep the synced version, keep your copy, or open both side by
+  side and merge by hand. A discarded copy goes to the vault trash; a replaced version stays in the history.
+</details>
+
+<details>
+<summary><b>🕰️ Version history</b></summary>
+
+- *Version history* in a note's file menu (or the command) lists earlier versions – one per sync that changed the note,
+  from every device. Configurable: 1–100 versions (default 20).
+- Preview with a diff against the current note, **Restore** or **Restore as copy**.
+- Versions come straight from the encrypted repository history – nothing extra is stored anywhere.
+- Restoring never loses the current content: unsynced changes are synced first, otherwise the restore is refused.
+</details>
+
+<details>
+<summary><b>🗑️ Deleted files</b></summary>
+
+- *Restore deleted files* lists files deleted on any device, most recent first, with preview and filter.
+- A file comes back at its old path, or as `Name (restored).ext` if that name is taken – nothing is overwritten.
+</details>
+
+<details>
+<summary><b>📦 Large files</b></summary>
+
+- Files over 4 MB are split into encrypted 4 MB chunks with random ids; after a change only the changed chunks are
+  uploaded.
+- The maximum file size is configurable up to 256 MB (default 50 MB). Larger files are skipped and reported – never
+  treated as deleted.
+</details>
+
+<details>
+<summary><b>🧭 Sync status in the file explorer</b></summary>
+
+`●` not synchronised yet · `⚠` conflict · `⊘` too large or unreadable · `◌` excluded by ignore rules.
+Folders show the most important mark of their contents. Can be turned off in the settings.
+</details>
+
+<details>
+<summary><b>📜 Sync activity</b></summary>
+
+A local log of what each sync did – which files were downloaded, uploaded, moved or deleted, plus restores and errors.
+Stored only on this device (status dialog → *Activity*).
+</details>
+
+<details>
+<summary><b>🔍 Verify repository</b></summary>
+
+Downloads and decrypts every file in the repository and checks it against the encrypted manifest. Read-only; reports
+missing or corrupted files by name. Needs about one GitHub request per file.
+</details>
+
+<details>
+<summary><b>🚚 Repository size &amp; moving to a new repository</b></summary>
+
+- Git keeps every version forever, so a repository only grows. The settings show its size and hint above 1 GB.
+- *Move vault to a new repository* copies the current state of all files – verified and re-encrypted – into a new,
+  empty private repository (it can be created for you) and continues there.
+- Nothing is deleted: the old repository stays as an archive, and version history and deleted files still reach into it.
+- Other devices stop syncing with the old repository and offer *Switch to new repository*; their unsynchronised
+  changes are kept. An interrupted move continues where it stopped.
+</details>
+
+<details>
+<summary><b>🙈 Ignore rules &amp; <code>.obsidian</code></b></summary>
+
+- `.vaultsyncignore` (gitignore-like syntax) excludes files before anything is encrypted. The file itself is synced.
+- Syncing the `.obsidian` folder is configurable: core settings (on by default), community plugins, themes & snippets
+  and the workspace layout separately. The plugin never syncs its own folder.
+</details>
+
+---
+
+## 🛡️ Security
+
+- **Cryptography:** AES-256-GCM with a fresh random nonce per encryption; every ciphertext is bound (as associated data)
+  to its kind, the vault and its object id, so objects can't be swapped or replayed. Keys are separated with HKDF.
+- **Password:** Argon2id (64 MiB, 3 iterations) – PBKDF2-SHA256 (600 000 iterations) as an alternative. Weakened
+  parameters in a manipulated repository are rejected.
+- **Integrity:** every download is authenticated and checked against the encrypted manifest before a single byte is
+  written. Chunks are verified individually and as a whole file.
+- **Rollback protection:** each manifest is bound to its parent commit and to the public config, versions must
+  increase, and history is followed through the encrypted parent links rather than by trusting GitHub's answers. A
+  force-push, deleted branch or replayed old state stops the sync – your local files stay untouched.
+- **Secrets:** the GitHub token and (optionally, “remember on this device”) the vault key live in Obsidian's
+  SecretStorage (OS keychain) – never in `data.json`, never in the vault, never in logs.
+- **Password changes do not revoke old secrets:** older commits still contain the old key slots. Keep the repository
+  private; after a leak, move the vault to a new repository and delete the old one.
+- **Reviewed:** a four-part security review (cryptography, malicious repository, secret leaks, local data integrity)
+  and the resulting fixes are documented in [docs/DESIGN.md §12](docs/DESIGN.md).
+
+**Disclosures:** network access only to `https://api.github.com` for the repository you configure · a GitHub account
+is required · no telemetry, analytics, ads or crash reports · no files outside the vault (local sync state lives in the
+plugin folder).
+
+Full design, threat model and data-loss analysis: **[docs/DESIGN.md](docs/DESIGN.md)**.
+
+---
+
+## 📏 Limits
+
+- Files larger than the configured maximum (hard limit 256 MB) are skipped and reported. Large files are held in memory
+  once while syncing.
+- Every version stays in the repository history forever – keep an eye on the size (GitHub recommends staying below a
+  few GB) and move to a fresh repository when needed.
+- Empty folders are not synchronised.
+- Two files whose names differ only in upper/lower case cannot both be synchronised (case-insensitive file systems on
+  Windows, macOS and iOS); the second one is reported and stays local.
+- All devices should run the same plugin version; an older version stops with “please update the plugin” and leaves
+  its files untouched.
+
+---
+
+## 🗺️ Roadmap: more storage backends
+
+Next up: **S3-compatible storage** (AWS S3, Cloudflare R2, MinIO, …) and **WebDAV** (Nextcloud, NAS, …) with the same
+features as GitHub – including version history, deleted files and moving between backends. The groundwork (a
+backend-neutral storage layer and a shared conformance test suite) is in place; the plan is in
+[docs/DESIGN.md §13](docs/DESIGN.md).
+
+---
+
+## ❓ FAQ
+
+<details>
+<summary><b>I forgot my password.</b></summary>
+
+Unlock with your recovery key and set a new password. Without password *and* recovery key the data is gone – that's
+the point of end-to-end encryption.
+</details>
+
+<details>
+<summary><b>Can I use it together with Obsidian Sync, iCloud or Dropbox?</b></summary>
+
+Not for the same vault at the same time – two sync tools fighting over the same files is the classic way to create
+duplicates. Pick one.
+</details>
+
+<details>
+<summary><b>Is a public repository OK?</b></summary>
+
+Contents and names stay encrypted, but anyone could download the encrypted data and see metadata (number of files,
+approximate sizes, change times). Use a private repository.
+</details>
+
+<details>
+<summary><b>What happens if someone manipulates the repository?</b></summary>
+
+Tampered or replayed data fails authentication and the sync stops with an explanation. Nothing is written into your
+vault. Someone with write access but without your key can at most block syncing – not read or change your notes.
+</details>
+
+<details>
+<summary><b>What if a sync is interrupted – app closed, phone offline, battery dead?</b></summary>
+
+Every step is crash-safe: local changes are applied from a write-ahead journal, commits only count once the branch has
+moved, and the next sync finishes or repeats whatever was interrupted.
+</details>
+
+---
+
+## 🛠️ Development
 
 ```bash
 npm install
-npm test          # unit, integration, security and randomised tests
-npm run build     # typecheck (strict) + bundle to main.js
+npm test               # unit, integration, security and randomised tests
+FUZZ_SEEDS=400 npm test  # longer randomised multi-device sessions
+npm run build          # strict typecheck + bundle to main.js
 ```
 
-Test suites:
+The sync engine is independent of Obsidian and runs completely in tests against an in-memory file system and fake
+remotes. Highlights of the test suite:
 
-* `crypto.test.ts` – AES-GCM round trips, wrong key / manipulated ciphertext, tag and nonce, nonce uniqueness,
-  Argon2id RFC 9106 vector, KDF downgrade protection, key wrapping, password change, recovery key, config MAC.
-* `manifest.test.ts` – serialize → encrypt → decrypt → deserialize, strict validation.
-* `sync.test.ts` – local/remote create, modify, delete, rename; conflicts; delete vs modify; concurrent pushes;
-  tombstones; offline; failure injection at every commit step and during local apply; repository
-  manipulation; password change and recovery.
-* `security.test.ts` / `github.test.ts` – scans everything stored remotely and every request sent to the
-  (emulated) GitHub API for plaintext contents, file and folder names.
-* `history.test.ts` – version listing across devices and renames, restore (only when the current content is
-  in the history), restore as copy, deleted versions, planted foreign objects, GitHub API requests.
-* `chunks.test.ts` – chunked round trips, delta uploads, chunk cleanup on change/rename/delete, history of chunked
-  files, swapped or corrupted chunks, malformed chunk indexes, chunk uploads over the GitHub API.
-* `migration.test.ts` – moving a vault (copy, marker, following devices with unsynced changes, archive history,
-  resume after crash, concurrent push, unsafe targets, GitHub API incl. repository creation).
-* `features.test.ts` – deleted-file restore, repository verification (corrupted/missing/orphaned objects),
-  activity reporting and log, conflict resolution safety, line diff, file explorer marks.
-* `fuzz.test.ts` – randomised two-device sessions (optionally with crashes, restarts and network drops;
-  each also with 3-byte chunks; one suite moves the vault mid-session)
-  checking that local content is never lost and that devices converge (`FUZZ_SEEDS=400 npm test`).
+| Suite | Covers |
+|---|---|
+| `crypto` | AES-GCM round trips, tampering, nonce uniqueness, Argon2id RFC 9106 vector, KDF downgrade, key wrapping, recovery key |
+| `sync` | Create/modify/delete/rename on both sides, conflicts, concurrent pushes, crashes at every commit step, replay and rollback attacks, key updates |
+| `conformance` | The contract every storage backend must fulfil (snapshots, compare-and-swap, history) |
+| `security` / `github` | Scans everything stored remotely and every request sent for plaintext (UTF-8, UTF-16, Base64, …) |
+| `history` · `chunks` · `features` · `migration` | Version history, large files, deleted files, verification, activity log, conflict resolution, vault moves |
+| `fuzz` | Randomised two-device sessions with crashes, restarts, network drops, tiny chunks, key updates and vault moves – no content may ever be lost and devices must converge |
+
+Architecture, formats and every data-loss scenario with its countermeasure: [docs/DESIGN.md](docs/DESIGN.md).
+
+---
+
+<div align="center">
+
+MIT License · made by [Sebastian Fischer](https://github.com/sebfischer83)
+
+</div>

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { GitHubError } from "../src/errors/GitHubError";
+import { RemoteError } from "../src/errors/RemoteError";
 import { SyncError } from "../src/errors/SyncError";
 import { SyncController, type SyncStatus, type Timers, type TriggerSettings } from "../src/sync/SyncController";
 import type { SyncMode, SyncReport } from "../src/sync/SyncEngine";
@@ -114,7 +114,7 @@ describe("sync controller (§17, §18, §35)", () => {
   it("retries network failures with growing backoff", async () => {
     let fail = true;
     const { controller, timers, calls, statuses } = setup({}, async () => {
-      if (fail) throw new GitHubError("Network");
+      if (fail) throw new RemoteError("Network");
       return REPORT;
     });
     await controller.requestSync("full");

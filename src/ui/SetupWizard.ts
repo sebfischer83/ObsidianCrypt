@@ -3,6 +3,8 @@ import { MIN_PASSWORD_LENGTH } from "../crypto/KeyManager";
 import { describeError, logUnexpected } from "../errors/VaultSyncError";
 import type EncryptedSyncPlugin from "../main";
 import type { RemoteInspection } from "../sync/VaultSetup";
+import { parseBackendLocation, type BackendLocation } from "../remote/BackendLocation";
+import type { Credentials } from "../remote/Credentials";
 import { formatBytes, showRecoveryKey } from "./Modals";
 
 type Step = "repository" | "create" | "join";
@@ -28,10 +30,12 @@ export class SetupWizard extends Modal {
     private readonly plugin: EncryptedSyncPlugin,
   ) {
     super(app);
-    this.owner = plugin.settings.owner;
-    this.repo = plugin.settings.repo;
-    this.branch = plugin.settings.branch || "main";
-    this.token = plugin.getToken() ?? "";
+    const current = plugin.settings.location;
+    this.owner = current?.kind === "github" ? current.owner : "";
+    this.repo = current?.kind === "github" ? current.repo : "";
+    this.branch = current?.kind === "github" ? current.branch : "main";
+    const credentials = plugin.getCredentials();
+    this.token = credentials?.kind === "github" ? credentials.token : "";
   }
 
   override onOpen(): void {
@@ -81,10 +85,22 @@ export class SetupWizard extends Modal {
       new Notice("Please fill in owner, repository and token.");
       return;
     }
+    let location: BackendLocation;
+    try {
+      location = parseBackendLocation({ kind: "github", owner: this.owner, repo: this.repo, branch: this.branch }, "repository");
+    } catch {
+      new Notice("Owner, repository or branch name is not valid.");
+      return;
+    }
+    const credentials: Credentials = { kind: "github", token: this.token };
     this.busy = true;
     try {
-      const result = await this.plugin.inspect(this.owner, this.repo, this.branch, this.token);
-      if (!result.canPush) {
+      const result = await this.plugin.inspect(location, credentials);
+      if (result.check.access === "missing") {
+        new Notice("The repository does not exist or the token cannot access it.", 8000);
+        return;
+      }
+      if (!result.check.writable) {
         new Notice("The token has no write access to this repository.", 8000);
         return;
       }
@@ -93,17 +109,14 @@ export class SetupWizard extends Modal {
         new Notice("This repository/branch already contains other files. Use an empty repository for the encrypted vault.", 10000);
         return;
       }
-      if (!result.isPrivate) {
+      if (result.check.isPrivate === false) {
         new Notice("Warning: the repository is public. Contents stay encrypted, but anyone can see the number, sizes and change times of encrypted objects.", 12000);
       }
-      this.plugin.settings.owner = this.owner;
-      this.plugin.settings.repo = this.repo;
-      this.plugin.settings.branch = this.branch;
-      this.plugin.setToken(this.token);
+      this.plugin.setCredentials(location, credentials);
       if (!this.plugin.secrets.persistent) {
         new Notice(`The system keychain is not available${this.plugin.secrets.lastError ? ` (${describeError(this.plugin.secrets.lastError, [this.token])})` : ""}. The token is kept in memory for this session only.`, 12000);
       }
-      await this.plugin.saveSettings();
+      await this.plugin.switchLocation(location);
       this.step = result.inspection.kind === "vault" ? "join" : "create";
       this.render();
     } catch (error: unknown) {

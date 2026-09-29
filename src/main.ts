@@ -3,10 +3,11 @@ import { WebCryptoProvider } from "./crypto/WebCryptoProvider";
 import { KeyManager, MIN_PASSWORD_LENGTH, unlockWithPassword, VaultKeys } from "./crypto/KeyManager";
 import { CryptoError } from "./errors/CryptoError";
 import { describeError, logUnexpected } from "./errors/VaultSyncError";
-import { PersonalAccessTokenAuth } from "./github/GitHubAuth";
-import { GitHubClient } from "./github/GitHubClient";
-import { GitObjectsApi } from "./github/GitObjectsApi";
-import { GitHubRemoteRepository } from "./github/GitHubRemoteRepository";
+import { RemoteError } from "./errors/RemoteError";
+import { gitHubBackend } from "./github/GitHubBackend";
+import { assertMatching, backendFor, registerBackend, type BackendCheck, type BackendDeps } from "./remote/Backend";
+import { describeLocation, sameLocation, toLocation, type BackendLocation } from "./remote/BackendLocation";
+import { credentialSecretId, credentialSecrets, parseCredentials, serializeCredentials, type Credentials } from "./remote/Credentials";
 import { ObsidianFileSystem } from "./platform/ObsidianFileSystem";
 import { ObsidianHttpClient } from "./platform/ObsidianHttpClient";
 import { DeviceLocalStore, ObsidianSecretStore, PluginFolderStore } from "./platform/ObsidianStorage";
@@ -23,9 +24,8 @@ import { ConflictResolver } from "./sync/ConflictResolver";
 import { DeletedFiles, type ResolvedDeletedFile } from "./sync/DeletedFiles";
 import { RepositoryVerifier, type VerifyReport } from "./sync/RepositoryVerifier";
 import { VersionHistory, type FileVersion, type HistorySource, type RestoreOutcome } from "./sync/VersionHistory";
-import { completeSwitch, followMove, moveVault, sameLocation } from "./sync/VaultMigration";
+import { completeSwitch, followMove, moveVault } from "./sync/VaultMigration";
 import { DEFAULT_CHUNK_SIZE } from "./sync/ChunkedContent";
-import type { RepoLocation } from "./manifest/Manifest";
 import type { PublicVaultConfig } from "./manifest/VaultConfig";
 import { SyncError } from "./errors/SyncError";
 import {
@@ -56,6 +56,8 @@ import { DeletedFilesModal } from "./ui/DeletedFilesModal";
 import { VerifyModal } from "./ui/VerifyModal";
 import { MoveVaultModal } from "./ui/MoveVaultModal";
 import { ExplorerStatus } from "./ui/ExplorerStatus";
+
+registerBackend(gitHubBackend);
 
 const DEVICE_ID_KEY = "encrypted-github-sync-device-id";
 const MIB = 1024 * 1024;
@@ -181,30 +183,45 @@ export default class EncryptedSyncPlugin extends Plugin {
     return id;
   }
 
-  private tokenSecretId(): string {
-    return SecretIds.githubToken(this.deviceId);
-  }
-
   private masterKeySecretId(vaultId: string): string {
     return SecretIds.masterKey(vaultId);
   }
 
-  getToken(): string | null {
-    return this.secrets.get(this.tokenSecretId());
+  /** Credentials for a location (default: the configured one) from the keychain, or null. */
+  getCredentials(location: BackendLocation | null = this.settings.location): Credentials | null {
+    if (!location) return null;
+    const raw = this.secrets.get(credentialSecretId(location));
+    if (raw) {
+      try {
+        return parseCredentials(raw, location.kind);
+      } catch {
+        return null;
+      }
+    }
+    // 0.4 and earlier kept one GitHub token per device.
+    if (location.kind === "github") {
+      const legacy = this.secrets.get(SecretIds.githubToken(this.deviceId));
+      if (legacy) return { kind: "github", token: legacy };
+    }
+    return null;
   }
 
-  setToken(token: string): void {
-    if (token) this.secrets.set(this.tokenSecretId(), token.trim());
-    else this.secrets.delete(this.tokenSecretId());
+  setCredentials(location: BackendLocation, credentials: Credentials | null): void {
+    if (credentials) {
+      assertMatching(location, credentials);
+      this.secrets.set(credentialSecretId(location), serializeCredentials(credentials));
+    } else {
+      this.secrets.delete(credentialSecretId(location));
+    }
   }
 
+  /** Every secret that must never appear in any message (for redaction). */
   private tokenList(): string[] {
-    const token = this.getToken();
-    return token ? [token] : [];
+    return credentialSecrets(this.getCredentials());
   }
 
   isConfigured(): boolean {
-    return !!(this.settings.owner && this.settings.repo && this.getToken() && this.store.state.vaultId);
+    return !!(this.settings.location && this.getCredentials() && this.store.state.vaultId);
   }
 
   filterSettings(): FilterSettings {
@@ -225,17 +242,22 @@ export default class EncryptedSyncPlugin extends Plugin {
     return new SyncFilter(this.filterSettings(), new IgnoreMatcher(rules));
   }
 
-  buildApi(owner = this.settings.owner, repo = this.settings.repo, token: string | null = this.getToken()): GitObjectsApi {
-    const client = new GitHubClient({
-      http: new ObsidianHttpClient(),
-      auth: new PersonalAccessTokenAuth(() => token),
-      logger: this.logger,
-    });
-    return new GitObjectsApi(client, owner, repo);
+  backendDeps(): BackendDeps {
+    return { http: new ObsidianHttpClient(), crypto: this.crypto, logger: this.logger };
   }
 
-  buildRemote(owner = this.settings.owner, repo = this.settings.repo, branch = this.settings.branch, token: string | null = this.getToken()): RemoteRepository {
-    return new GitHubRemoteRepository(this.buildApi(owner, repo, token), { branch });
+  /** The remote for a location (default: the configured one) with its stored or the given credentials. */
+  buildRemote(location: BackendLocation | null = this.settings.location, credentials: Credentials | null = this.getCredentials(location)): RemoteRepository {
+    if (!location) throw new SyncError("NotConfigured");
+    if (!credentials) throw new RemoteError("Authentication");
+    assertMatching(location, credentials);
+    return backendFor(location.kind).build(location as never, credentials as never, this.backendDeps());
+  }
+
+  /** Access check of a location (exists, writable, private). */
+  checkLocation(location: BackendLocation, credentials: Credentials): Promise<BackendCheck> {
+    assertMatching(location, credentials);
+    return backendFor(location.kind).check(location as never, credentials as never, this.backendDeps());
   }
 
   private buildEngine(): SyncEngine {
@@ -346,11 +368,10 @@ export default class EncryptedSyncPlugin extends Plugin {
 
   // ───────────────────────── setup flows ─────────────────────────
 
-  async inspect(owner: string, repo: string, branch: string, token: string): Promise<{ inspection: RemoteInspection; canPush: boolean; isPrivate: boolean }> {
-    const api = this.buildApi(owner, repo, token);
-    const info = await api.getRepository();
-    const inspection = await inspectRemote(new GitHubRemoteRepository(api, { branch }));
-    return { inspection, canPush: info.canPush, isPrivate: info.isPrivate };
+  async inspect(location: BackendLocation, credentials: Credentials): Promise<{ inspection: RemoteInspection; check: BackendCheck }> {
+    const check = await this.checkLocation(location, credentials);
+    const inspection: RemoteInspection = check.access === "ok" ? await inspectRemote(this.buildRemote(location, credentials)) : { kind: "uninitialized" };
+    return { inspection, check };
   }
 
   async localSummary(): Promise<UploadSummary> {
@@ -517,20 +538,41 @@ export default class EncryptedSyncPlugin extends Plugin {
 
   // ───────────────────────── repository size / moving the vault ─────────────────────────
 
-  currentLocation(): RepoLocation {
-    return { owner: this.settings.owner, repo: this.settings.repo, branch: this.settings.branch };
+  currentLocation(): BackendLocation {
+    if (!this.settings.location) throw new SyncError("NotConfigured");
+    return this.settings.location;
   }
 
-  /** Earlier repositories of a moved vault (read-only history sources). */
+  /**
+   * Credentials for another location: stored ones, or – for the same backend kind – the current ones (a
+   * GitHub token usually covers the new repository too). Stored for that location once used.
+   */
+  private credentialsFor(location: BackendLocation): Credentials | null {
+    const stored = this.getCredentials(location);
+    if (stored) return stored;
+    const current = this.getCredentials();
+    return current && current.kind === location.kind ? current : null;
+  }
+
+  /** Earlier locations of a moved vault (read-only history sources; archives without credentials are skipped). */
   private archiveSources(): HistorySource[] {
-    return (this.store.state.remote?.movedFrom ?? []).map((a) => ({ remote: this.buildRemote(a.owner, a.repo, a.branch), from: a.commit }));
+    const sources: HistorySource[] = [];
+    for (const archive of this.store.state.remote?.movedFrom ?? []) {
+      const location = toLocation(archive);
+      const credentials = this.credentialsFor(location);
+      if (credentials) sources.push({ remote: this.buildRemote(location, credentials), from: archive.commit });
+    }
+    return sources;
   }
 
-  /** Repository size as reported by GitHub (cached for 10 minutes; GitHub itself updates it lazily). */
+  /** Storage size as reported by the backend (cached for 10 minutes; GitHub itself updates it lazily). */
   async repositorySize(force = false): Promise<number | null> {
     const now = Date.now();
     if (!force && this.sizeCache && now - this.sizeCache.at < 10 * 60_000) return this.sizeCache.bytes;
-    const bytes = (await this.buildApi().getRepository()).sizeBytes;
+    const location = this.currentLocation();
+    const credentials = this.getCredentials(location);
+    const size = backendFor(location.kind).size;
+    const bytes = size && credentials ? await size(location as never, credentials as never, this.backendDeps()) : null;
     this.sizeCache = { at: now, bytes };
     return bytes;
   }
@@ -540,28 +582,40 @@ export default class EncryptedSyncPlugin extends Plugin {
     const bytes = await this.repositorySize().catch(() => null);
     if (bytes === null || bytes < SIZE_WARNING_BYTES) return;
     this.sizeWarned = true;
-    new Notice(`The repository is ${formatBytes(bytes)} large. Every version stays in its history; you can continue in a fresh repository (settings → Move to a new repository).`, 15000);
+    new Notice(`The storage is ${formatBytes(bytes)} large. Every version stays in its history; you can continue in a fresh location (settings → Move to a new repository).`, 15000);
   }
 
-  /** What a target repository for a move currently is. */
-  async inspectMoveTarget(target: RepoLocation): Promise<{ state: "missing" | "empty" | "resumable" | "foreign" | "otherVault"; isPrivate: boolean }> {
-    const api = this.buildApi(target.owner, target.repo);
-    const repo = await api.getRepository();
-    if (!repo.exists) return { state: "missing", isPrivate: false };
-    const inspection = await inspectRemote(this.buildRemote(target.owner, target.repo, target.branch));
+  /** What a target location for a move currently is. */
+  async inspectMoveTarget(target: BackendLocation): Promise<{ state: "missing" | "empty" | "resumable" | "foreign" | "otherVault"; isPrivate: boolean }> {
+    const credentials = this.credentialsFor(target);
+    if (!credentials) throw new RemoteError("Authentication");
+    const check = await this.checkLocation(target, credentials);
+    if (check.access === "missing") return { state: "missing", isPrivate: false };
+    const inspection = await inspectRemote(this.buildRemote(target, credentials));
     const state = inspection.kind === "uninitialized" ? "empty" : inspection.kind === "foreign" ? "foreign" : inspection.config.vaultId === this.store.state.vaultId ? "resumable" : "otherVault";
-    return { state, isPrivate: repo.isPrivate };
+    // A backend without a public/private notion is as private as its access control.
+    return { state, isPrivate: check.isPrivate ?? true };
   }
 
-  async createMoveTarget(target: RepoLocation): Promise<void> {
-    await this.buildApi(target.owner, target.repo).createPrivateRepository();
+  canCreateMoveTarget(target: BackendLocation): boolean {
+    return backendFor(target.kind).create !== undefined;
   }
 
-  /** Syncs, copies the vault into `target`, retires the current repository and switches this device over. */
-  async moveToRepository(target: RepoLocation, onProgress: (done: number, total: number) => void): Promise<number> {
+  async createMoveTarget(target: BackendLocation): Promise<void> {
+    const credentials = this.credentialsFor(target);
+    const create = backendFor(target.kind).create;
+    if (!credentials || !create) throw new RemoteError("Unsupported");
+    await create(target as never, credentials as never, this.backendDeps());
+  }
+
+  /** Syncs, copies the vault into `target`, retires the current location and switches this device over. */
+  async moveToRepository(target: BackendLocation, onProgress: (done: number, total: number) => void): Promise<number> {
+    const credentials = this.credentialsFor(target);
+    if (!credentials) throw new RemoteError("Authentication");
     const report = await this.controller.runNow("full");
     if (!report) throw new SyncError("InvalidState", "synchronisation is not possible right now (locked, blocked or already running)");
     const source = this.currentLocation();
+    this.setCredentials(target, credentials);
     const result = await this.controller.runExclusive(() =>
       moveVault({
         crypto: this.crypto,
@@ -570,50 +624,52 @@ export default class EncryptedSyncPlugin extends Plugin {
         deviceId: this.deviceId,
         source: this.buildRemote(),
         sourceLocation: source,
-        target: this.buildRemote(target.owner, target.repo, target.branch),
+        target: this.buildRemote(target, credentials),
         targetLocation: target,
         limits: { chunkSize: DEFAULT_CHUNK_SIZE },
         onProgress,
       }),
     );
     await this.finishPendingSwitch();
-    await this.logAction(`Vault moved from ${source.owner}/${source.repo} to ${target.owner}/${target.repo} (${result.copied} files copied)`, []);
+    await this.logAction(`Vault moved from ${describeLocation(source)} to ${describeLocation(target)} (${result.copied} files copied)`, []);
     void this.controller.requestSync("full");
     return result.copied;
   }
 
-  /** After another device moved the vault: continue in the repository its marker names (following chains). */
+  /** After another device moved the vault: continue in the location its marker names (following chains). */
   async followVaultMove(): Promise<void> {
     for (let hop = 0; hop < 5; hop++) {
       const moved = this.store.state.movedTo;
       if (!moved) break;
+      const target = toLocation(moved);
+      const credentials = this.credentialsFor(target);
+      if (!credentials) throw new RemoteError("Authentication");
       const source = this.currentLocation();
       await this.controller.runExclusive(() =>
-        followMove({ crypto: this.crypto, keys: this.keyManager.keys, store: this.store, deviceId: this.deviceId, sourceLocation: source, target: this.buildRemote(moved.owner, moved.repo, moved.branch) }),
+        followMove({ crypto: this.crypto, keys: this.keyManager.keys, store: this.store, deviceId: this.deviceId, sourceLocation: source, target: this.buildRemote(target, credentials) }),
       );
+      this.setCredentials(target, credentials);
       await this.finishPendingSwitch();
-      await this.logAction(`Switched to the new repository ${moved.owner}/${moved.repo}`, []);
+      await this.logAction(`Switched to the new location ${describeLocation(target)}`, []);
     }
     this.controller.clearBlock();
     void this.controller.requestSync("full");
   }
 
   /**
-   * Completes a recorded repository switch: settings first, then the sync state. Both steps are idempotent,
+   * Completes a recorded location switch: settings first, then the sync state. Both steps are idempotent,
    * so an interruption at any point is finished by the next call (plugin start, every sync).
    */
   private async finishPendingSwitch(): Promise<void> {
     const pending = this.store.state.pendingSwitch;
     if (!pending) return;
-    if (!sameLocation(this.currentLocation(), pending.location)) await this.switchLocation(pending.location);
+    if (!this.settings.location || !sameLocation(this.settings.location, pending.location)) await this.switchLocation(pending.location);
     completeSwitch(this.store.state);
     await this.store.persist();
   }
 
-  private async switchLocation(target: RepoLocation): Promise<void> {
-    this.settings.owner = target.owner;
-    this.settings.repo = target.repo;
-    this.settings.branch = target.branch;
+  async switchLocation(target: BackendLocation): Promise<void> {
+    this.settings.location = toLocation(target);
     this.sizeCache = null;
     this.sizeWarned = false;
     await this.saveSettings();
@@ -703,9 +759,9 @@ export default class EncryptedSyncPlugin extends Plugin {
 
   private registerCommands(): void {
     this.addCommand({ id: "sync-now", name: "Sync now", callback: () => void this.syncCommand("full") });
-    this.addCommand({ id: "pull", name: "Pull from GitHub", callback: () => void this.syncCommand("pull") });
+    this.addCommand({ id: "pull", name: "Pull remote changes", callback: () => void this.syncCommand("pull") });
     // Pushing always pulls and merges first (never a blind or forced push).
-    this.addCommand({ id: "push", name: "Push to GitHub", callback: () => void this.syncCommand("full") });
+    this.addCommand({ id: "push", name: "Push local changes", callback: () => void this.syncCommand("full") });
     this.addCommand({ id: "show-status", name: "Show status", callback: () => this.openStatus() });
     this.addCommand({ id: "show-conflicts", name: "Show conflicts", callback: () => this.openConflicts() });
     this.addCommand({ id: "lock", name: "Lock vault", callback: () => this.lock() });

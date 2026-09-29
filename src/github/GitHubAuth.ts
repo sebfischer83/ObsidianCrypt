@@ -1,4 +1,4 @@
-import { GitHubError } from "../errors/GitHubError";
+import { RemoteError } from "../errors/RemoteError";
 
 /**
  * Authentication strategy. Version 1 ships fine-grained personal access tokens; GitHub App / OAuth device
@@ -16,7 +16,7 @@ export class PersonalAccessTokenAuth implements AuthProvider {
 
   async authorizationHeader(): Promise<string> {
     const token = this.getToken();
-    if (!token) throw new GitHubError("Authentication");
+    if (!token) throw new RemoteError("Authentication");
     return `Bearer ${token}`;
   }
 

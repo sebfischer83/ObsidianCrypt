@@ -561,3 +561,24 @@ seinen Parent gebundenes Manifest; die Fuzz-Sitzungen enthalten jetzt zufällige
 
 Verhaltensänderung der Ignore-Regeln (M1): `**` innerhalb eines Namens (`a**b`) wirkt wie `*` und überschreitet keine
 Ordnergrenze mehr (wie bei gitignore); Regeln über 1024 Zeichen bzw. 64 Segmente werden ignoriert.
+
+## 13. Mehrere Backends (in Arbeit)
+
+Plan: GitHub, S3-kompatible Speicher und WebDAV mit identischem Funktionsumfang. S3/WebDAV bilden die
+Git-Semantik (Commits mit einem Parent, Snapshots, CAS auf den Head, Historie pro Objekt) als Commit-Log auf einem
+Objektspeicher nach (`ObjectStoreRepository` über einem minimalen `BlobStore`; Details im Plan).
+
+**Stand Phase 0 (Verallgemeinerung, kein neues Verhalten):**
+
+* `RemoteError` ersetzt `GitHubError` (gleiche Kategorien + `Unsupported`, `ClockSkew`); `src/net/HttpClient`
+  (binäre Bodies, HEAD/PUT/DELETE/PROPFIND/MKCOL).
+* `BackendLocation` (`src/remote/BackendLocation.ts`): `github {owner, repo, branch}` | `s3 {endpoint, region, bucket,
+  prefix, pathStyle}` | `webdav {url}`; strikt validiert (https außer localhost, keine Zugangsdaten/Query/Fragment,
+  keine Punkt-Segmente). Ersetzt die GitHub-Adresse in Einstellungen, `movedTo`/`movedFrom` (Manifest-Format 5,
+  ältere Formate ohne `kind` werden als GitHub gelesen) und im lokalen State.
+* Zugangsdaten pro Speicherort (`src/remote/Credentials.ts`, SecretStore-ID aus dem kanonischen Schlüssel des Orts);
+  der frühere GitHub-Token pro Gerät wird weiter gelesen.
+* Backend-Registry (`src/remote/Backend.ts`, `src/github/GitHubBackend.ts`): `build`, `check`, optional `size`,
+  `create`. `main.ts` baut Remotes nur noch über die Registry.
+* Konformitäts-Suite (`test/fakes/conformance.ts`) legt den Vertrag von `RemoteRepository` fest und läuft gegen
+  jedes Backend; `twoDevicesOn(factory)` führt die Sync-Szenarien auf beliebigen Backends aus.

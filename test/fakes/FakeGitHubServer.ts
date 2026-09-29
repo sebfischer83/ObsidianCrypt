@@ -1,5 +1,5 @@
 import { sha256 } from "@noble/hashes/sha2.js";
-import type { HttpClient, HttpRequest, HttpResponse } from "../../src/github/HttpClient";
+import type { HttpClient, HttpRequest, HttpResponse } from "../../src/net/HttpClient";
 import { fromBase64, toHex, utf8Decode, utf8Encode } from "../../src/util/bytes";
 
 interface CommitObject {
@@ -88,7 +88,7 @@ export class FakeGitHubServer implements HttpClient {
     const url = new URL(req.url);
     if (req.method === "GET" && url.pathname === "/user") return this.json(200, { login: this.owner });
     if (req.method === "POST" && (url.pathname === "/user/repos" || url.pathname === `/orgs/${this.owner}/repos`)) {
-      const body = JSON.parse(req.body ?? "{}") as Record<string, unknown>;
+      const body = JSON.parse(bodyText(req) ?? "{}") as Record<string, unknown>;
       if (!this.canCreateRepos) return this.json(403, { message: "Resource not accessible by personal access token" });
       if (body.name !== this.repo || this.repoExists) return this.json(422, { message: "name already exists" });
       if (body.private !== true) throw new Error("plugin must only create private repositories");
@@ -98,7 +98,8 @@ export class FakeGitHubServer implements HttpClient {
     const prefix = `/repos/${this.owner}/${this.repo}`;
     if (!url.pathname.startsWith(prefix) || !this.repoExists) return this.json(404, { message: "Not Found" });
     const path = decodeURIComponent(url.pathname.slice(prefix.length));
-    const body = req.body ? (JSON.parse(req.body) as Record<string, unknown>) : {};
+    const text = bodyText(req);
+    const body = text ? (JSON.parse(text) as Record<string, unknown>) : {};
     const empty = this.commits.size === 0;
     if (req.method !== "GET" && !this.canPush) return this.json(403, { message: "Resource not accessible by personal access token" });
 
@@ -252,7 +253,7 @@ export class FakeGitHubServer implements HttpClient {
     const out: Uint8Array[] = [];
     for (const r of this.requests) {
       out.push(utf8Encode(r.url));
-      if (r.body) out.push(utf8Encode(r.body));
+      if (r.body) out.push(typeof r.body === "string" ? utf8Encode(r.body) : r.body);
     }
     for (const b of this.blobs.values()) out.push(b);
     for (const c of this.commits.values()) out.push(utf8Encode(c.message));
@@ -276,4 +277,8 @@ export class FakeGitHubServer implements HttpClient {
   text(data: Uint8Array): string {
     return utf8Decode(data);
   }
+}
+
+function bodyText(req: HttpRequest): string | undefined {
+  return req.body === undefined ? undefined : typeof req.body === "string" ? req.body : utf8Decode(req.body);
 }

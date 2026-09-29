@@ -1,7 +1,7 @@
 import type { CryptoProvider } from "../crypto/CryptoProvider";
 import { EncryptionEngine } from "../crypto/EncryptionEngine";
 import type { VaultKeys } from "../crypto/KeyManager";
-import { GitHubError } from "../errors/GitHubError";
+import { RemoteError } from "../errors/RemoteError";
 import { SyncError } from "../errors/SyncError";
 import { isLive } from "../manifest/Manifest";
 import type { ObjectRevision, RemoteRepository } from "../remote/RemoteRepository";
@@ -92,7 +92,7 @@ export class VersionHistory {
     try {
       return await readObjectContent(source.remote, engine, version.commit, version.objectId, null, HARD_MAX_FILE_SIZE);
     } catch (error: unknown) {
-      if (error instanceof GitHubError && error.category === "NotFound") return null;
+      if (error instanceof RemoteError && error.category === "NotFound") return null;
       throw error;
     }
   }

@@ -1,3 +1,5 @@
+import type { ArchivedLocation, BackendLocation } from "../remote/BackendLocation";
+
 /**
  * The decrypted manifest: mapping of stable object ids to vault paths and content metadata.
  * It only ever exists in plaintext in memory and in the local state; remotely it is encrypted.
@@ -12,23 +14,14 @@ export const MANIFEST_TYPE = "obsidian-encrypted-sync-manifest";
  *   3  `movedTo` / `movedFrom` (vault moved to another repository)
  *   4  `configHash` is mandatory: binds the public config to the manifest (an older, validly signed config
  *      can no longer be combined with a newer manifest)
+ *   5  locations in `movedTo` / `movedFrom` carry a backend `kind` (GitHub, S3, WebDAV)
  * Every manifest written by this version uses the newest format.
  */
-export const MANIFEST_FORMAT_VERSION = 4;
+export const MANIFEST_FORMAT_VERSION = 5;
 export const MOVE_FORMAT_VERSION = 3;
 export const CONFIG_HASH_FORMAT_VERSION = 4;
+export const LOCATION_KIND_FORMAT_VERSION = 5;
 export const MAX_MANIFEST_FORMAT_VERSION = MANIFEST_FORMAT_VERSION;
-
-export interface RepoLocation {
-  readonly owner: string;
-  readonly repo: string;
-  readonly branch: string;
-}
-
-/** An earlier repository of this vault, readable up to `commit` (its "moved" marker). */
-export interface ArchivedRepo extends RepoLocation {
-  readonly commit: string;
-}
 
 export interface LiveEntry {
   readonly path: string;
@@ -63,9 +56,9 @@ export interface Manifest {
   readonly updatedAt: number;
   readonly entries: Readonly<Record<string, ManifestEntry>>;
   /** Terminal marker: this repository is retired, the vault continues there (format 3). */
-  readonly movedTo?: RepoLocation;
+  readonly movedTo?: BackendLocation;
   /** Earlier repositories of this vault, newest first (format 3). Carried over by every commit. */
-  readonly movedFrom?: readonly ArchivedRepo[];
+  readonly movedFrom?: readonly ArchivedLocation[];
   /** SHA-256 (hex) of the serialised `.vaultsync/config` of the same commit (mandatory from format 4). */
   readonly configHash?: string;
 }

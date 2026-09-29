@@ -1,4 +1,4 @@
-import { GitHubError } from "../errors/GitHubError";
+import { RemoteError } from "../errors/RemoteError";
 import { expectArray, expectRecord, expectString, GIT_SHA, isRecord } from "../util/validate";
 import { encodePath, type GitHubClient } from "./GitHubClient";
 
@@ -107,7 +107,7 @@ export class GitObjectsApi {
       const record = expectRecord(c, "commit");
       const commit = expectRecord(record.commit, "commit.commit");
       const date = Date.parse(expectString(expectRecord(commit.committer, "commit.committer").date, "commit.committer.date"));
-      if (!Number.isFinite(date)) throw new GitHubError("InvalidResponse");
+      if (!Number.isFinite(date)) throw new RemoteError("InvalidResponse");
       return { sha: expectString(record.sha, "commit.sha", GIT_SHA), date, message: expectString(commit.message, "commit.message") };
     });
   }
@@ -184,6 +184,6 @@ export class GitObjectsApi {
 }
 
 function sha(value: string): string {
-  if (!GIT_SHA.test(value)) throw new GitHubError("InvalidResponse");
+  if (!GIT_SHA.test(value)) throw new RemoteError("InvalidResponse");
   return value;
 }

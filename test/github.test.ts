@@ -3,7 +3,7 @@ import { PersonalAccessTokenAuth } from "../src/github/GitHubAuth";
 import { GitHubClient } from "../src/github/GitHubClient";
 import { GitObjectsApi } from "../src/github/GitObjectsApi";
 import { GitHubRemoteRepository } from "../src/github/GitHubRemoteRepository";
-import { GitHubError } from "../src/errors/GitHubError";
+import { RemoteError } from "../src/errors/RemoteError";
 import { SyncError } from "../src/errors/SyncError";
 import { describeError } from "../src/errors/VaultSyncError";
 import { ARMOR_PREFIX, MANIFEST_PATH } from "../src/remote/RemoteLayout";
@@ -127,8 +127,8 @@ describe("GitHub client behaviour", () => {
     const { server, api } = setup();
     for (let i = 0; i < 10; i++) server.failures.push({ match: () => true, networkError: true });
     const error = await api.getRepository().catch((e: unknown) => e);
-    expect(error).toBeInstanceOf(GitHubError);
-    expect((error as GitHubError).category).toBe("Network");
+    expect(error).toBeInstanceOf(RemoteError);
+    expect((error as RemoteError).category).toBe("Network");
   });
 
   it("respects secondary rate limits (retry-after)", async () => {
@@ -143,26 +143,26 @@ describe("GitHub client behaviour", () => {
     const reset = Math.floor(Date.now() / 1000) + 3600;
     server.failures.push({ match: () => true, status: 403, headers: { "x-ratelimit-remaining": "0", "x-ratelimit-reset": String(reset) } });
     const error = await api.getRepository().catch((e: unknown) => e);
-    expect((error as GitHubError).category).toBe("RateLimit");
-    expect((error as GitHubError).retryAfterMs).toBeGreaterThan(60_000);
+    expect((error as RemoteError).category).toBe("RateLimit");
+    expect((error as RemoteError).retryAfterMs).toBeGreaterThan(60_000);
   });
 
   it("classifies authentication, authorization and missing repositories", async () => {
     const wrongToken = setup(new FakeGitHubServer(), "github_pat_WRONG_TOKEN_abcdef");
     const authError = await wrongToken.remote.getHead().catch((e: unknown) => e);
-    expect((authError as GitHubError).category).toBe("Authentication");
+    expect((authError as RemoteError).category).toBe("Authentication");
     expect(describeError(authError)).not.toContain("github_pat_WRONG_TOKEN_abcdef");
 
     const missing = setup();
     missing.server.repoExists = false;
     const repoError = await missing.remote.getHead().catch((e: unknown) => e);
-    expect((repoError as GitHubError).category).toBe("RepositoryMissing");
+    expect((repoError as RemoteError).category).toBe("RepositoryMissing");
 
     const readonly = await githubDevices();
     readonly.server.canPush = false;
     readonly.a.fs.setText("x.md", "x");
     const pushError = await readonly.a.sync().catch((e: unknown) => e);
-    expect((pushError as GitHubError).category).toBe("Authorization");
+    expect((pushError as RemoteError).category).toBe("Authorization");
   });
 
   it("never puts the token into URLs or error messages", async () => {
@@ -172,7 +172,7 @@ describe("GitHub client behaviour", () => {
     await a.sync();
     expect(server.requests.some((r) => r.url.includes(server.token))).toBe(false);
     for (const status of [400, 401, 403, 404, 409, 422, 500]) {
-      expect(new GitHubError("ServerError", status).message).not.toContain(server.token);
+      expect(new RemoteError("ServerError", status).message).not.toContain(server.token);
     }
   });
 });

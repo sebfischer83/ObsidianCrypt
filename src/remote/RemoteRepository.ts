@@ -50,7 +50,7 @@ export interface RemoteRepository {
   /** Encrypted manifest at a commit, or null if the file does not exist. */
   readManifest(commit: string): Promise<Uint8Array | null>;
 
-  /** Encrypted object envelope at a commit. Throws GitHubError("NotFound") if missing. */
+  /** Encrypted object envelope at a commit. Throws RemoteError("NotFound") if missing. */
   readObject(commit: string, objectId: string): Promise<Uint8Array>;
 
   /**
@@ -85,7 +85,8 @@ export interface RemoteRepository {
 
   /**
    * Atomically moves the branch from `expectedParent` to `newCommit` (compare-and-swap, never forced).
-   * Throws SyncError("ConcurrentRemoteUpdate") if the branch no longer points to `expectedParent`.
+   * Throws SyncError("ConcurrentRemoteUpdate") if the branch no longer points to `expectedParent` – unless it
+   * already contains `newCommit` (a repeated update that landed before is not an error).
    */
   updateHead(expectedParent: string, newCommit: string): Promise<void>;
 
