@@ -594,7 +594,7 @@ export default class EncryptedSyncPlugin extends Plugin {
     const bytes = await this.repositorySize().catch(() => null);
     if (bytes === null || bytes < SIZE_WARNING_BYTES) return;
     this.sizeWarned = true;
-    new Notice(`The storage is ${formatBytes(bytes)} large. Every version stays in its history; you can continue in a fresh location (settings → Move to a new repository).`, 15000);
+    new Notice(`The storage is ${formatBytes(bytes)} large. Every version stays in its history; you can continue in a fresh location (settings → Storage → Move to a new location).`, 15000);
   }
 
   /** What a target location for a move currently is. */

@@ -122,19 +122,29 @@ export class SettingsTab extends PluginSettingTab {
           }
         }),
       );
+      const configured = this.plugin.isConfigured();
+      const explanation = "Every version stays in the history; moving to a new repository starts over with only the current files and keeps this one as an archive.";
+      // Loaded on request only: opening this section froze the app on iOS while the size was requested.
       const sizeSetting = new Setting(containerEl)
         .setName("Repository size")
-        .setDesc(this.plugin.isConfigured() ? "Loading…" : "Not configured")
-        .addButton((b) => b.setButtonText("Move to a new repository").setDisabled(!this.plugin.isConfigured()).onClick(() => this.plugin.openMoveVault()));
-      if (this.plugin.isConfigured()) {
-        void this.task("repository size", () => this.plugin.repositorySize())
-          .then((bytes) =>
-            sizeSetting.setDesc(
-              `${bytes === null ? "unknown" : formatBytes(bytes)} (as reported by the storage). Every version stays in the history; moving to a new repository starts over with only the current files and keeps this one as an archive.`,
-            ),
-          )
-          .catch((error: unknown) => sizeSetting.setDesc(`Size unavailable: ${describeError(error)}`));
-      }
+        .setDesc(configured ? explanation : "Not configured")
+        .addButton((b) =>
+          b
+            .setButtonText("Show size")
+            .setDisabled(!configured)
+            .onClick(() => {
+              b.setDisabled(true);
+              sizeSetting.setDesc("Loading…");
+              void this.task("repository size request", () => this.plugin.repositorySize())
+                .then((bytes) => sizeSetting.setDesc(`${bytes === null ? "unknown" : formatBytes(bytes)} (as reported by the storage). ${explanation}`))
+                .catch((error: unknown) => sizeSetting.setDesc(`Size unavailable: ${describeError(error)}`))
+                .finally(() => b.setDisabled(false));
+            }),
+        );
+      new Setting(containerEl)
+        .setName("Move to a new location")
+        .setDesc("Continue in a fresh repository with only the current files; this one stays available as an archive for the version history.")
+        .addButton((b) => b.setButtonText("Move…").setDisabled(!configured).onClick(() => this.plugin.openMoveVault()));
     });
 
     this.group(containerEl, "encryption", "Encryption", (containerEl) => {
