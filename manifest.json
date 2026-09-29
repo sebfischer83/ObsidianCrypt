@@ -1,7 +1,7 @@
 {
   "id": "encrypted-github-sync",
   "name": "Encrypted GitHub Sync",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "minAppVersion": "1.11.4",
   "description": "End-to-end encrypted sync of your vault with a GitHub repository. Contents, file names and folders never leave the device unencrypted.",
   "author": "Sebastian Fischer",
