@@ -1,16 +1,19 @@
 import { Notice, PluginSettingTab, Setting, type App, type ButtonComponent } from "obsidian";
 import type { SyncStatus } from "../sync/SyncController";
 import { statusRows } from "./StatusModal";
-import { MIN_PASSWORD_LENGTH } from "../crypto/KeyManager";
 import { describeError } from "../errors/VaultSyncError";
 import type EncryptedSyncPlugin from "../main";
 import { MAX_FILE_SIZE_MB_LIMIT } from "../settings";
 import { MAX_VERSION_LIMIT } from "../sync/VersionHistory";
 import { IGNORE_FILE } from "../vault/SyncFilter";
-import { confirmDialog, formatBytes, promptVaultSecret } from "./Modals";
+import { confirmDialog, formatBytes, promptSecretText, promptVaultSecret } from "./Modals";
+import { DeviceLocalStore } from "../platform/ObsidianStorage";
 import { SetupWizard } from "./SetupWizard";
 import { describeLocation } from "../remote/BackendLocation";
 import { statusText } from "./StatusBar";
+
+const STAGE_KEY = "encrypted-sync-settings-stage";
+const STAGE_DONE = "done";
 
 export class SettingsTab extends PluginSettingTab {
   constructor(
@@ -24,6 +27,9 @@ export class SettingsTab extends PluginSettingTab {
   private liveRows = new Map<string, Setting>();
   private syncButton: ButtonComponent | null = null;
   private statusSetting: Setting | null = null;
+  private readonly local = new DeviceLocalStore(this.app);
+  private syncStage: string | null = null;
+  private readonly openTasks = new Set<string>();
 
   override hide(): void {
     this.unsubscribe?.();
@@ -52,6 +58,16 @@ export class SettingsTab extends PluginSettingTab {
     const s = this.plugin.settings;
     const save = async (): Promise<void> => this.plugin.saveSettings();
 
+    const previous = this.local.get(STAGE_KEY);
+    if (previous && previous !== STAGE_DONE) {
+      containerEl.createEl("p", {
+        cls: "mod-warning",
+        text: `The last time this page was opened, it did not finish (stopped at: ${previous}). If the app froze, please report this line.`,
+      });
+    }
+    this.openTasks.clear();
+    this.section("status");
+
     // ── Status (live) ──
     this.statusSetting = new Setting(containerEl)
       .addButton((b) => {
@@ -63,6 +79,7 @@ export class SettingsTab extends PluginSettingTab {
       .addButton((b) => b.setButtonText("Details").onClick(() => this.plugin.openStatus()));
 
     // ── Storage ──
+    this.section("storage");
     new Setting(containerEl).setName("Storage").setHeading();
     new Setting(containerEl)
       .setName("Location")
@@ -70,21 +87,22 @@ export class SettingsTab extends PluginSettingTab {
       .addButton((b) => b.setButtonText(this.plugin.isConfigured() ? "Change / reconnect" : "Set up").setCta().onClick(() => new SetupWizard(this.app, this.plugin).open()));
     if (s.location?.kind === "github") {
       const location = s.location;
+      const stored = this.plugin.getCredentials() !== null;
       new Setting(containerEl)
         .setName("Access token")
-        .setDesc(this.plugin.secrets.persistent ? "Stored in the system keychain (never in data.json or the vault)." : "Secret storage unavailable: the token is kept in memory only for this session.")
-        .addText((t) => {
-          t.inputEl.type = "password";
-          t.setPlaceholder(this.plugin.getCredentials() ? "•••••••• (stored)" : "github_pat_…");
-          t.inputEl.addEventListener("change", () => {
-            if (t.getValue()) {
-              this.plugin.setCredentials(location, { kind: "github", token: t.getValue().trim() });
-              t.setValue("");
-              new Notice("Token saved.");
-              this.display();
-            }
-          });
-        });
+        .setDesc(
+          `${stored ? "Stored" : "Not stored"} · ${this.plugin.secrets.persistent ? "kept in the system keychain (never in data.json or the vault)." : "secret storage unavailable: the token is kept in memory only for this session."}`,
+        )
+        // A dialog instead of an inline password field: iOS can hang on password fields in long settings pages.
+        .addButton((b) =>
+          b.setButtonText(stored ? "Replace token" : "Enter token").onClick(async () => {
+            const token = await promptSecretText(this.app, "GitHub access token", "Fine-grained token with Contents read/write for this repository only.", "github_pat_…");
+            if (!token) return;
+            this.plugin.setCredentials(location, { kind: "github", token });
+            new Notice("Token saved.");
+            this.display();
+          }),
+        );
     }
     new Setting(containerEl).setName("Test connection").addButton((b) =>
       b.setButtonText("Test").onClick(async () => {
@@ -113,17 +131,17 @@ export class SettingsTab extends PluginSettingTab {
       .setDesc(this.plugin.isConfigured() ? "Loading…" : "Not configured")
       .addButton((b) => b.setButtonText("Move to a new repository").setDisabled(!this.plugin.isConfigured()).onClick(() => this.plugin.openMoveVault()));
     if (this.plugin.isConfigured()) {
-      void this.plugin
-        .repositorySize()
+      void this.task("repository size", () => this.plugin.repositorySize())
         .then((bytes) =>
           sizeSetting.setDesc(
-            `${bytes === null ? "unknown" : formatBytes(bytes)} (as reported by GitHub). Every version stays in the history; moving to a new repository starts over with only the current files and keeps this one as an archive.`,
+            `${bytes === null ? "unknown" : formatBytes(bytes)} (as reported by the storage). Every version stays in the history; moving to a new repository starts over with only the current files and keeps this one as an archive.`,
           ),
         )
         .catch((error: unknown) => sizeSetting.setDesc(`Size unavailable: ${describeError(error)}`));
     }
 
     // ── Encryption ──
+    this.section("encryption");
     new Setting(containerEl).setName("Encryption").setHeading();
     const unlocked = this.plugin.keyManager.isUnlocked;
     new Setting(containerEl)
@@ -147,7 +165,12 @@ export class SettingsTab extends PluginSettingTab {
       .setName("Remember vault key on this device")
       .setDesc("Keeps the vault key in the system keychain so automatic sync works after restarts. Disable to enter the password each session.")
       .addToggle((t) => t.setValue(s.rememberKey).onChange((v) => void this.plugin.setRememberKey(v)));
-    this.passwordSection(containerEl, unlocked);
+    new Setting(containerEl)
+      .setName("Change password")
+      .setDesc(
+        "Re-encrypts only the vault key; your files are not re-uploaded. Other devices keep working. The old password is not revoked: older commits in the repository history still accept it – if it leaked, also move the vault to a new repository and delete the old one.",
+      )
+      .addButton((b) => b.setButtonText("Change password").setDisabled(!unlocked).onClick(() => this.plugin.openChangePassword()));
     new Setting(containerEl)
       .setName("Recovery key")
       .setDesc("Create a new recovery key (requires the vault password). The new key replaces the old one for the current repository.")
@@ -181,6 +204,7 @@ export class SettingsTab extends PluginSettingTab {
     });
 
     // ── Synchronisation ──
+    this.section("synchronization");
     new Setting(containerEl).setName("Synchronization").setHeading();
     new Setting(containerEl).setName("Auto sync").addToggle((t) => t.setValue(s.autoSync).onChange(async (v) => ((s.autoSync = v), await save())));
     new Setting(containerEl).setName("Sync after changes").addToggle((t) => t.setValue(s.syncAfterChanges).onChange(async (v) => ((s.syncAfterChanges = v), await save())));
@@ -209,6 +233,7 @@ export class SettingsTab extends PluginSettingTab {
     new Setting(containerEl).setName("Sync on app resume").addToggle((t) => t.setValue(s.syncOnResume).onChange(async (v) => ((s.syncOnResume = v), await save())));
 
     // ── Files ──
+    this.section("files");
     new Setting(containerEl).setName("Files").setHeading();
     new Setting(containerEl).setName(`Sync ${this.app.vault.configDir}`).addToggle((t) => t.setValue(s.syncConfigDir).onChange(async (v) => ((s.syncConfigDir = v), await save(), this.display())));
     if (s.syncConfigDir) {
@@ -226,10 +251,10 @@ export class SettingsTab extends PluginSettingTab {
       .addTextArea((ta) => {
         ta.inputEl.rows = 6;
         ta.inputEl.addClass("encrypted-sync-ignore-rules");
-        void (async (): Promise<void> => {
+        void this.task("ignore rules", async (): Promise<void> => {
           const exists = await this.app.vault.adapter.exists(IGNORE_FILE);
           ta.setValue(exists ? await this.app.vault.adapter.read(IGNORE_FILE) : "");
-        })();
+        }).catch(() => undefined);
         ta.inputEl.addEventListener("change", async () => {
           await this.app.vault.adapter.write(IGNORE_FILE, ta.getValue());
           new Notice("Ignore rules saved.");
@@ -260,11 +285,12 @@ export class SettingsTab extends PluginSettingTab {
       );
 
     // ── Version history ──
+    this.section("version history");
     new Setting(containerEl).setName("Version history").setHeading();
     new Setting(containerEl)
       .setName("Versions per note")
       .setDesc(
-        `How many earlier versions of a Markdown note can be restored (1–${MAX_VERSION_LIMIT}). Versions are read from the encrypted GitHub history (one per sync that changed the note); nothing is stored additionally and older versions are never deleted there.`,
+        `How many earlier versions of a Markdown note can be restored (1–${MAX_VERSION_LIMIT}). Versions are read from the encrypted history in the storage (one per sync that changed the note); nothing is stored additionally and older versions are never deleted there.`,
       )
       .addSlider((sl) =>
         sl
@@ -279,6 +305,7 @@ export class SettingsTab extends PluginSettingTab {
       .addButton((b) => b.setButtonText("Show").onClick(() => this.plugin.openDeletedFiles()));
 
     // ── Diagnostics ──
+    this.section("diagnostics");
     new Setting(containerEl).setName("Diagnostics").setHeading();
     for (const [name, value] of statusRows(this.plugin, this.plugin.statusSummary())) {
       this.liveRows.set(name, new Setting(containerEl).setName(name).setDesc(value));
@@ -291,7 +318,7 @@ export class SettingsTab extends PluginSettingTab {
       .addButton((b) => b.setButtonText("Open").onClick(() => this.plugin.openActivity()));
     new Setting(containerEl)
       .setName("Verify repository")
-      .setDesc("Downloads and decrypts every file on GitHub and checks it against the manifest. Read-only.")
+      .setDesc("Downloads and decrypts every stored file and checks it against the manifest. Read-only.")
       .addButton((b) => b.setButtonText("Verify").onClick(() => this.plugin.openVerify()));
     new Setting(containerEl)
       .setName("Debug logging")
@@ -306,43 +333,34 @@ export class SettingsTab extends PluginSettingTab {
 
     this.renderLive(this.plugin.statusSummary());
     this.unsubscribe = this.plugin.onStatusChange((status) => this.renderLive(status));
+    this.section(null);
   }
 
-  private passwordSection(containerEl: HTMLElement, unlocked: boolean): void {
-    let current = "";
-    let next = "";
-    let repeat = "";
-    const pw = (setting: Setting, set: (v: string) => void, autocomplete: "current-password" | "new-password"): Setting =>
-      setting.addText((t) => {
-        t.inputEl.type = "password";
-        t.inputEl.autocomplete = autocomplete;
-        t.onChange(set);
-      });
-    new Setting(containerEl).setName("Change password").setDesc("Re-encrypts only the vault key; your files are not re-uploaded. Other devices keep working. The old password is not revoked: older commits in the repository history still accept it – if it leaked, also move the vault to a new repository and delete the old one.");
-    pw(new Setting(containerEl).setName("Current password").setClass("setting-indent"), (v) => (current = v), "current-password");
-    pw(new Setting(containerEl).setName("New password").setClass("setting-indent"), (v) => (next = v), "new-password");
-    pw(new Setting(containerEl).setName("Repeat new password").setClass("setting-indent"), (v) => (repeat = v), "new-password").addButton((b) =>
-      b
-        .setButtonText("Change password")
-        .setDisabled(!unlocked)
-        .onClick(async () => {
-          if (next !== repeat) {
-            new Notice("The new passwords do not match.");
-            return;
-          }
-          if ([...next.normalize("NFC")].length < MIN_PASSWORD_LENGTH) {
-            new Notice(`The new password needs at least ${MIN_PASSWORD_LENGTH} characters.`);
-            return;
-          }
-          try {
-            await this.plugin.changePassword(current, next);
-            current = next = repeat = "";
-            new Notice("Vault password changed.");
-            this.display();
-          } catch (error: unknown) {
-            new Notice(describeError(error), 8000);
-          }
-        }),
-    );
+  /**
+   * Records which part of the page is being built (device-local, synchronous), so a hang on a device without
+   * developer tools can be located: the next opening shows where the previous one stopped.
+   */
+  private section(name: string | null): void {
+    this.syncStage = name;
+    this.persistStage();
+  }
+
+  /** Tracks background work started by the page (it may finish after rendering). */
+  private task<T>(name: string, work: () => Promise<T>): Promise<T> {
+    this.openTasks.add(name);
+    this.persistStage();
+    return work().finally(() => {
+      this.openTasks.delete(name);
+      this.persistStage();
+    });
+  }
+
+  private persistStage(): void {
+    const value = [this.syncStage, ...this.openTasks].filter(Boolean).join(", ") || STAGE_DONE;
+    try {
+      this.local.set(STAGE_KEY, value);
+    } catch {
+      // Diagnostics only.
+    }
   }
 }

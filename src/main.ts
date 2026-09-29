@@ -190,7 +190,18 @@ export default class EncryptedSyncPlugin extends Plugin {
   /** Credentials for a location (default: the configured one) from the keychain, or null. */
   getCredentials(location: BackendLocation | null = this.settings.location): Credentials | null {
     if (!location) return null;
-    const raw = this.secrets.get(credentialSecretId(location));
+    // Status updates and the settings page ask often; the platform keychain is read once per location.
+    const id = credentialSecretId(location);
+    if (this.credentialCache.has(id)) return this.credentialCache.get(id) ?? null;
+    const credentials = this.readCredentials(location, id);
+    this.credentialCache.set(id, credentials);
+    return credentials;
+  }
+
+  private readonly credentialCache = new Map<string, Credentials | null>();
+
+  private readCredentials(location: BackendLocation, id: string): Credentials | null {
+    const raw = this.secrets.get(id);
     if (raw) {
       try {
         return parseCredentials(raw, location.kind);
@@ -207,6 +218,7 @@ export default class EncryptedSyncPlugin extends Plugin {
   }
 
   setCredentials(location: BackendLocation, credentials: Credentials | null): void {
+    this.credentialCache.delete(credentialSecretId(location));
     if (credentials) {
       assertMatching(location, credentials);
       this.secrets.set(credentialSecretId(location), serializeCredentials(credentials));
@@ -795,7 +807,7 @@ export default class EncryptedSyncPlugin extends Plugin {
     );
   }
 
-  private openChangePassword(): void {
+  openChangePassword(): void {
     if (!this.keyManager.isUnlocked) {
       new Notice("Unlock the vault first.");
       return;

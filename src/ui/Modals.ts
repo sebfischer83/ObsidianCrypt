@@ -86,6 +86,41 @@ export function promptVaultSecret(app: App, title: string, description: string, 
   });
 }
 
+/** Asks for one secret value (e.g. an access token). The field only exists while the dialog is open. */
+export function promptSecretText(app: App, title: string, description: string, placeholder: string): Promise<string | null> {
+  return new Promise((resolve) => {
+    let done = false;
+    new (class extends Modal {
+      private value = "";
+      override onOpen(): void {
+        this.titleEl.setText(title);
+        this.contentEl.createEl("p", { text: description });
+        new Setting(this.contentEl).addText((t) => {
+          t.inputEl.type = "password";
+          t.inputEl.autocomplete = "off";
+          t.setPlaceholder(placeholder);
+          t.onChange((v) => (this.value = v));
+          t.inputEl.addEventListener("keydown", (e) => {
+            if (e.key === "Enter") this.submit();
+          });
+        });
+        new Setting(this.contentEl).addButton((b) => b.setButtonText("Save").setCta().onClick(() => this.submit()));
+      }
+      submit(): void {
+        if (!this.value.trim()) return;
+        done = true;
+        resolve(this.value.trim());
+        this.value = "";
+        this.close();
+      }
+      override onClose(): void {
+        this.contentEl.empty();
+        if (!done) resolve(null);
+      }
+    })(app).open();
+  });
+}
+
 /** Shows the recovery key once and requires the user to confirm they stored it externally. */
 export function showRecoveryKey(app: App, recoveryKey: string): Promise<void> {
   return new Promise((resolve) => {
